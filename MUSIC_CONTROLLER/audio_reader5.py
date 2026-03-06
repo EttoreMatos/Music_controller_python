@@ -243,11 +243,27 @@ class TransitionEvent:
 # ---------------------------------------------------------------------------
 
 class MusicLEDController:
-    def __init__(self, port="/dev/ttyACM0", baudrate=115200, fps=None, config=None):
+    def __init__(
+        self,
+        port="/dev/ttyACM0",
+        baudrate=115200,
+        fps=None,
+        config=None,
+        middle_bpm_multiplier=1.0,
+        show_youtube_video=False,
+    ):
         self.port      = port
         self.baudrate  = baudrate
         self.config    = config or EffectConfig()
         self.fps       = self.config.FPS if fps is None else int(fps)
+        try:
+            speed_mult = float(middle_bpm_multiplier)
+        except Exception:
+            speed_mult = 1.0
+        if not np.isfinite(speed_mult) or speed_mult <= 0.0:
+            speed_mult = 1.0
+        self.middle_bpm_multiplier = speed_mult
+        self.show_youtube_video = bool(show_youtube_video)
         self.ser       = None
         self.playing   = False
         self._temp_playback_files = set()
@@ -825,8 +841,12 @@ class MusicLEDController:
         _has_low  = bool(np.any(low_mask))
         _has_high = bool(np.any(high_mask))
 
+        middle_tempo_bpm = tempo_bpm * self.middle_bpm_multiplier
+        if not np.isfinite(middle_tempo_bpm) or middle_tempo_bpm <= 1.0:
+            middle_tempo_bpm = tempo_bpm
+
         base_step_frames = int(np.clip(
-            round((60.0 / tempo_bpm) * self.fps * cfg.BPM_STEP_MULT),
+            round((60.0 / middle_tempo_bpm) * self.fps * cfg.BPM_STEP_MULT),
             cfg.STEP_FRAMES_MIN, cfg.STEP_FRAMES_MAX,
         ))
         base_speed = 1.0 / float(base_step_frames)
@@ -1185,10 +1205,17 @@ class MusicLEDController:
         # Converte beat frames (espaço librosa) → frames da partitura (FPS)
         beat_times_s  = librosa.frames_to_time(beat_librosa, sr=sr)
         beat_frames   = (beat_times_s * self.fps).astype(np.int32)
+        middle_tempo_bpm = tempo_bpm * self.middle_bpm_multiplier
+        if not np.isfinite(middle_tempo_bpm) or middle_tempo_bpm <= 1.0:
+            middle_tempo_bpm = tempo_bpm
 
         log_sub(
             f"BPM detectado: {_c(f'{tempo_bpm:.1f}', C.BMAGENTA, C.BOLD)}"
             f"  |  {_c(len(beat_frames), C.BYELLOW)} batidas mapeadas"
+        )
+        log_sub(
+            f"BPM LEDs do meio: {_c(f'{middle_tempo_bpm:.1f}', C.BCYAN, C.BOLD)}"
+            f"  ({_c(f'x{self.middle_bpm_multiplier:.1f}', C.BYELLOW)})"
         )
 
         section_line()
@@ -1300,7 +1327,56 @@ class MusicLEDController:
             log_err("Falha ao reproduzir áudio com ffplay.")
             self.playing = False
 
-    def play_audio_thread(self, audio_source):
+    def _play_youtube_video_in_terminal(self, video_source):
+        mpv_bin = shutil.which("mpv")
+        if not mpv_bin:
+            log_warn(
+                "mpv não encontrado para vídeo no terminal. "
+                "Mantendo reprodução somente de áudio."
+            )
+            return False
+
+        vo_candidates = ("tct", "caca")
+        for vo in vo_candidates:
+            cmd = [
+                mpv_bin,
+                "--no-config",
+                "--really-quiet",
+                "--terminal=yes",
+                "--force-window=no",
+                f"--vo={vo}",
+                video_source,
+            ]
+            proc = subprocess.Popen(cmd)
+            time.sleep(0.7)
+            if proc.poll() is not None:
+                if proc.returncode == 0:
+                    return True
+                continue
+            try:
+                while self.playing and proc.poll() is None:
+                    time.sleep(0.1)
+            finally:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=1.0)
+                    except Exception:
+                        proc.kill()
+            if proc.returncode in (0, None):
+                return True
+
+        log_warn(
+            "mpv não conseguiu renderizar vídeo no terminal (vo=tct/caca). "
+            "Mantendo reprodução somente de áudio."
+        )
+        return False
+
+    def play_audio_thread(self, audio_source, youtube_video_source=None):
+        if self.show_youtube_video and youtube_video_source:
+            if self._play_youtube_video_in_terminal(youtube_video_source):
+                return
+
         if self._is_url(audio_source):
             self._play_with_ffplay(
                 audio_source, "ffplay não encontrado para reproduzir stream."
@@ -1319,7 +1395,7 @@ class MusicLEDController:
                 pygame.mixer.quit()
             self._play_with_ffplay(audio_source, "ffplay não encontrado.")
 
-    def sync_and_play(self, audio_source):
+    def sync_and_play(self, audio_source, youtube_video_source=None):
         led_patterns, duration, playback_source = self.process_audio_file(audio_source)
 
         if not self.ser or not self.ser.is_open:
@@ -1333,7 +1409,8 @@ class MusicLEDController:
 
         self.playing = True
         audio_thread = threading.Thread(
-            target=self.play_audio_thread, args=(playback_source,)
+            target=self.play_audio_thread,
+            args=(playback_source, youtube_video_source),
         )
         audio_thread.start()
         time.sleep(0.1)
@@ -1380,7 +1457,9 @@ class MusicLEDController:
                 if sleep_time > 0:
                     time.sleep(sleep_time)
 
-                if i % self.fps == 0:
+                if i % self.fps == 0 and not (
+                    self.show_youtube_video and youtube_video_source
+                ):
                     elapsed = time.time() - start_time
                     pct     = elapsed / max(duration, 1) * 100.0
                     filled  = int(pct / 100 * 20)
@@ -1473,6 +1552,58 @@ def select_audio_source():
     return ("youtube", query.strip())
 
 
+def select_middle_led_speed_multiplier():
+    try:
+        from PyQt5.QtWidgets import QApplication, QInputDialog
+    except Exception:
+        log_err("PyQt5 não encontrado. Instale com: pip install PyQt5")
+        return None
+    app = QApplication.instance()
+    owns_app = app is None
+    if owns_app:
+        app = QApplication(sys.argv)
+    options = ["Mais lento (1x BPM)", "Mais rápido (2x BPM)"]
+    choice, ok = QInputDialog.getItem(
+        None,
+        "Velocidade LEDs do meio",
+        "Escolha a velocidade dos LEDs do meio:",
+        options,
+        0,
+        False,
+    )
+    if owns_app:
+        app.quit()
+    if not ok:
+        return None
+    return 1.0 if choice == options[0] else 2.0
+
+
+def select_show_youtube_video_in_terminal():
+    try:
+        from PyQt5.QtWidgets import QApplication, QInputDialog
+    except Exception:
+        log_err("PyQt5 não encontrado. Instale com: pip install PyQt5")
+        return None
+    app = QApplication.instance()
+    owns_app = app is None
+    if owns_app:
+        app = QApplication(sys.argv)
+    options = ["Não", "Sim"]
+    choice, ok = QInputDialog.getItem(
+        None,
+        "Vídeo do YouTube",
+        "Deseja exibir vídeo do YouTube no terminal?",
+        options,
+        0,
+        False,
+    )
+    if owns_app:
+        app.quit()
+    if not ok:
+        return None
+    return choice == options[1]
+
+
 def resolve_youtube_stream(query_or_url):
     try:
         import yt_dlp
@@ -1492,9 +1623,9 @@ def resolve_youtube_stream(query_or_url):
         info = next((e for e in info["entries"] if e), None)
         if not info:
             raise RuntimeError("playlist vazia")
+    formats = info.get("formats") or []
     stream_url = info.get("url")
     if not stream_url:
-        formats    = info.get("formats") or []
         audio_only = [
             f for f in formats
             if f.get("url")
@@ -1506,7 +1637,23 @@ def resolve_youtube_stream(query_or_url):
             stream_url = audio_only[-1]["url"]
     if not stream_url:
         raise RuntimeError("não foi possível resolver a URL de áudio do YouTube")
-    return stream_url, info.get("title") or "YouTube"
+
+    av_formats = [
+        f for f in formats
+        if f.get("url")
+        and f.get("acodec") not in (None, "none")
+        and f.get("vcodec") not in (None, "none")
+    ]
+    video_stream_url = None
+    if av_formats:
+        av_formats.sort(
+            key=lambda f: (f.get("height") or 0.0, f.get("tbr") or 0.0)
+        )
+        video_stream_url = av_formats[-1]["url"]
+    if not video_stream_url:
+        video_stream_url = stream_url
+
+    return stream_url, info.get("title") or "YouTube", video_stream_url
 
 
 # ---------------------------------------------------------------------------
@@ -1522,11 +1669,27 @@ def main():
         log_warn("Nenhuma fonte selecionada. Encerrando.")
         return
 
+    middle_speed_mult = select_middle_led_speed_multiplier()
+    if middle_speed_mult is None:
+        log_warn("Nenhuma velocidade para LEDs do meio selecionada. Encerrando.")
+        return
+    speed_label = "mais rápido (2x BPM)" if middle_speed_mult > 1.0 else "mais lento (padrão)"
+    log_ok(f"Velocidade dos LEDs do meio: {_c(speed_label, C.BYELLOW)}")
+
     source_type, source_value = selection
+    show_youtube_video = False
+    youtube_video_source = None
     if source_type == "youtube":
+        show_youtube_video = select_show_youtube_video_in_terminal()
+        if show_youtube_video is None:
+            log_warn("Nenhuma opção de vídeo selecionada. Encerrando.")
+            return
+        video_label = "ativado (terminal)" if show_youtube_video else "desativado"
+        log_ok(f"Vídeo do YouTube: {_c(video_label, C.BYELLOW)}")
+
         log_step("Resolvendo stream do YouTube via yt-dlp...")
         try:
-            audio_file, title = resolve_youtube_stream(source_value)
+            audio_file, title, youtube_video_source = resolve_youtube_stream(source_value)
             log_ok(f"Stream pronto: {_c(title, C.BYELLOW)}")
         except Exception as exc:
             log_err(f"Falha ao resolver stream: {exc}")
@@ -1534,7 +1697,12 @@ def main():
     else:
         audio_file = source_value
 
-    controller = MusicLEDController(port=arduino_port, fps=30)
+    controller = MusicLEDController(
+        port=arduino_port,
+        fps=30,
+        middle_bpm_multiplier=middle_speed_mult,
+        show_youtube_video=show_youtube_video,
+    )
 
     section_line()
     if not controller.connect_arduino():
@@ -1542,7 +1710,10 @@ def main():
         return
 
     try:
-        controller.sync_and_play(audio_file)
+        controller.sync_and_play(
+            audio_file,
+            youtube_video_source=youtube_video_source,
+        )
     except FileNotFoundError:
         log_err(f"Arquivo não encontrado: {audio_file}")
     except Exception as exc:
