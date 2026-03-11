@@ -1,5 +1,5 @@
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum, auto
 import os
 import signal
@@ -74,6 +74,7 @@ def progress_bar(current, total, width=30, label=""):
 
 
 SEEK_STEP_S = 10
+_QT_ENV_CONFIGURED = False
 
 
 class KeyReader:
@@ -281,6 +282,9 @@ class TransitionEffectType(Enum):
     SPLIT         = auto()   # bordas→centro (anti-cascade) – queda de graves
     SPARKLE       = auto()   # flashes aleatórios rápidos  – hi-hats / percussão alta
     BURST         = auto()   # todos acendem e decaem      – impacto súbito
+    WAVE          = auto()   # onda senoidal correndo      – groove contínuo
+    ALTERNATE     = auto()   # pares alternando            – batida marcada
+    RIPPLE        = auto()   # pulso centro→bordas         – transição musical
 
 
 _EFFECT_ICONS = {
@@ -294,6 +298,9 @@ _EFFECT_ICONS = {
     TransitionEffectType.SPLIT:         ("◄►◄", C.BYELLOW),
     TransitionEffectType.SPARKLE:       ("✦✦✦", C.BWHITE),
     TransitionEffectType.BURST:         ("❋❋❋", C.BRED),
+    TransitionEffectType.WAVE:          ("≈≈≈", C.BCYAN),
+    TransitionEffectType.ALTERNATE:     ("╳╳╳", C.BMAGENTA),
+    TransitionEffectType.RIPPLE:        ("◍◍◍", C.BGREEN),
 }
 
 
@@ -370,11 +377,21 @@ class EffectConfig:
     # Segmentação estrutural                                               #
     # ------------------------------------------------------------------ #
 
-    SEG_HOP_SECONDS: float = 1.25
-    SEG_K_SEGMENTS: int = 40
-    SEG_MIN_GAP_SECONDS: float = 2.0
+    SEG_HOP_SECONDS: float = 0.85
+    SEG_K_SEGMENTS: int = 56
+    SEG_MIN_GAP_SECONDS: float = 1.4
     SEG_IGNORE_START_SECONDS: float = 2.5
-    SEG_NOVELTY_THRESHOLD: float = 0.18
+    SEG_NOVELTY_THRESHOLD: float = 0.16
+    # Distância cosseno mínima entre "antes" e "depois" da fronteira.
+    # Filtra picos locais de novidade que não chegam a trocar seção.
+    SEG_STRUCT_CHANGE_THRESHOLD: float = 0.10
+    # Quanto tempo à frente (após a fronteira) medimos a persistência da mudança.
+    # Usado para diagnóstico/telemetria; não bloqueia transições.
+    SEG_PERSISTENCE_AHEAD_SECONDS: float = 3.0
+    # Referência para marcar "mudança curta" no log.
+    SEG_MIN_PERSIST_DELTA: float = 0.06
+    # Referência de persistência relativa para marcar "mudança curta" no log.
+    SEG_PERSISTENCE_MIN_RATIO: float = 0.50
     # Soma mínima de beat_norm + kick_norm depois da fronteira.
     # Rejeita transições em silêncio ou energia irrisória.
     # FIX #12: era 0.08 — ligeiramente relaxado; 0.10 filtra mais trechos de silêncio.
@@ -404,6 +421,8 @@ class EffectConfig:
     # Fração de correção aplicada ao phase_accumulator após cada transição.
     # 1.0 = snap instantâneo ao grid de batidas; 0.0 = sem correção.
     BPM_RESYNC_STRENGTH: float = 0.85
+    # Correção leve e contínua para manter troca de sequência no tempo.
+    BPM_CONTINUOUS_SYNC_STRENGTH: float = 0.06
 
     # FIX #7: frames de lag acumulado antes de pular um frame visual.
     PLAYBACK_MAX_DRIFT_FRAMES: int = 2
@@ -734,6 +753,14 @@ class MusicLEDController:
         return float(np.mean(arr[lo:hi + 1]))
 
     @staticmethod
+    def _cosine_distance(vec_a: np.ndarray, vec_b: np.ndarray) -> float:
+        denom = float(np.linalg.norm(vec_a) * np.linalg.norm(vec_b))
+        if denom <= 1e-12:
+            return 0.0
+        cos_sim = float(np.dot(vec_a, vec_b) / denom)
+        return float(np.clip(1.0 - cos_sim, 0.0, 2.0))
+
+    @staticmethod
     def _snap_to_beats(
         transitions: list,
         beat_frames: np.ndarray,
@@ -747,8 +774,12 @@ class MusicLEDController:
         e frame_end para o beat que minimiza o desvio da duração desejada.
         Garante que nenhuma transição sobreponha a próxima.
         """
+        if not transitions:
+            return []
+
+        ordered = sorted(transitions, key=lambda t: t.frame_start)
         if len(beat_frames) < 2:
-            return transitions
+            return ordered
 
         bf = np.sort(beat_frames.astype(np.int32))
         beat_period = fps * 60.0 / tempo_bpm   # frames por beat (média)
@@ -784,7 +815,7 @@ class MusicLEDController:
             return min(end, n_frames - 1)
 
         snapped = []
-        for t in transitions:
+        for t in ordered:
             s = nearest_beat(t.frame_start)
             e = snap_end(s, t.frame_end - t.frame_start)
             snapped.append(TransitionEvent(
@@ -946,6 +977,10 @@ class MusicLEDController:
 
         ignore_start = cfg.SEG_IGNORE_START_SECONDS
         min_gap      = cfg.SEG_MIN_GAP_SECONDS
+        wins_ctx     = max(1, int(np.ceil(2.0 / cfg.SEG_HOP_SECONDS)))
+        persist_wins = max(
+            1, int(np.ceil(cfg.SEG_PERSISTENCE_AHEAD_SECONDS / cfg.SEG_HOP_SECONDS))
+        )
 
         valid_boundaries = []
         last_accepted_time = -999.0
@@ -961,7 +996,33 @@ class MusicLEDController:
                 continue
             if (b_time - last_accepted_time) < min_gap:
                 continue
-            valid_boundaries.append(b_time)
+
+            w_bef_lo = max(0, b_win - wins_ctx)
+            w_bef_hi = max(0, b_win - 1)
+            w_aft_lo = min(n_win - 1, b_win)
+            w_aft_hi = min(n_win - 1, b_win + wins_ctx)
+            w_far_lo = min(n_win - 1, b_win + persist_wins)
+            w_far_hi = min(n_win - 1, w_far_lo + wins_ctx)
+
+            vec_bef = np.mean(feat_matrix[:, w_bef_lo:w_bef_hi + 1], axis=1)
+            vec_aft = np.mean(feat_matrix[:, w_aft_lo:w_aft_hi + 1], axis=1)
+            vec_far = np.mean(feat_matrix[:, w_far_lo:w_far_hi + 1], axis=1)
+
+            struct_delta = self._cosine_distance(vec_bef, vec_aft)
+            persist_delta = self._cosine_distance(vec_bef, vec_far)
+            persist_ratio = persist_delta / (struct_delta + 1e-9)
+
+            if struct_delta < cfg.SEG_STRUCT_CHANGE_THRESHOLD:
+                continue
+
+            is_short_change = (
+                persist_delta < cfg.SEG_MIN_PERSIST_DELTA
+                or persist_ratio < cfg.SEG_PERSISTENCE_MIN_RATIO
+            )
+
+            valid_boundaries.append(
+                (b_time, struct_delta, persist_delta, persist_ratio, is_short_change)
+            )
             last_accepted_time = b_time
 
         log_sub(
@@ -973,10 +1034,15 @@ class MusicLEDController:
         p95_low  = float(np.percentile(low_energy_per_win, 95)) + 1e-9
 
         transitions = []
-        wins_ctx = max(1, int(2.0 / cfg.SEG_HOP_SECONDS))
         wm = self._window_mean
 
-        for b_time in valid_boundaries:
+        for (
+            b_time,
+            struct_delta,
+            persist_delta,
+            persist_ratio,
+            is_short_change,
+        ) in valid_boundaries:
             b_win = int(np.clip(int(b_time / cfg.SEG_HOP_SECONDS), 0, n_win - 1))
 
             w_bef_lo = max(0, b_win - wins_ctx)
@@ -1004,6 +1070,8 @@ class MusicLEDController:
                     f"{_c('ignorada (silêncio)', C.DIM)}"
                     f"  beat={_c(f'{beat_norm_after:.2f}', C.DIM)}"
                     f"  kick={_c(f'{kick_mean_after:.2f}', C.DIM)}"
+                    f"  Δ={_c(f'{struct_delta:.2f}', C.DIM)}"
+                    f"  Δp={_c(f'{persist_delta:.2f}', C.DIM)}"
                 )
                 continue
 
@@ -1044,11 +1112,18 @@ class MusicLEDController:
             ))
 
             icon, color = _EFFECT_ICONS[eff_type]
+            short_tag = (
+                _c("  curta✓", C.BMAGENTA, C.BOLD) if is_short_change else ""
+            )
             log_sub(
                 f"t={_c(f'{b_time:6.2f}s', C.BYELLOW)}  "
                 f"{_c(icon, color)}  {_c(f'{eff_type.name:<14}', color, C.BOLD)}"
                 f"  beat={_c(f'{beat_norm_after:.2f}', C.BCYAN)}"
                 f"  kick={_c(f'{kick_mean_after:.2f}', C.BMAGENTA)}"
+                f"  Δ={_c(f'{struct_delta:.2f}', C.BBLUE)}"
+                f"  Δp={_c(f'{persist_delta:.2f}', C.BCYAN)}"
+                f"  pers={_c(f'{persist_ratio:.2f}', C.BCYAN)}"
+                f"{short_tag}"
                 f"  flat={_c(f'{flat_aft:.2f}', C.DIM)}"
                 f"  dur={_c(f'{dur_s:.2f}s', C.DIM)}"
             )
@@ -1071,6 +1146,9 @@ class MusicLEDController:
         cfg: EffectConfig,
     ) -> TransitionEffectType:
 
+        if flatness > (cfg.NOISE_FLATNESS_THRESHOLD + 0.08) and beat_norm > 0.30:
+            return TransitionEffectType.ALTERNATE
+
         if flatness > cfg.NOISE_FLATNESS_THRESHOLD:
             return TransitionEffectType.GLITCH
 
@@ -1084,10 +1162,20 @@ class MusicLEDController:
         if beat_norm > 0.78 and kick_strength > 0.50:
             return TransitionEffectType.SWEEP
 
+        if beat_norm > 0.72 and 0.30 <= kick_strength <= 0.55:
+            return TransitionEffectType.WAVE
+
         if kick_strength > 0.55 or (energy_rising and beat_norm > 0.45):
             return TransitionEffectType.REVERSE_SWEEP
 
         # Percussão alta / hi-hats sem muita energia de graves
+        if (
+            centroid_norm > cfg.BRIGHT_CENTROID_THRESHOLD
+            and kick_strength < 0.35
+            and beat_norm > 0.35
+        ):
+            return TransitionEffectType.RIPPLE
+
         if centroid_norm > cfg.BRIGHT_CENTROID_THRESHOLD and kick_strength < 0.35:
             return TransitionEffectType.SPARKLE
 
@@ -1102,10 +1190,12 @@ class MusicLEDController:
             return TransitionEffectType.BREATHE
 
         if beat_norm > 0.45:
+            if centroid_norm > (cfg.BRIGHT_CENTROID_THRESHOLD * 0.90):
+                return TransitionEffectType.ALTERNATE
             return TransitionEffectType.PING_PONG
 
         if beat_norm > 0.20:
-            return TransitionEffectType.SWEEP
+            return TransitionEffectType.WAVE
 
         return TransitionEffectType.REVERSE_SWEEP
 
@@ -1172,6 +1262,37 @@ class MusicLEDController:
             levels[3] = base   * B
             levels[1] = offset * B
             levels[2] = offset * B
+
+        elif effect_type == TransitionEffectType.WAVE:
+            cycles = 1.2 + beat_norm * 1.6
+            for idx in range(4):
+                phase = t * (2.0 * np.pi * cycles) - idx * 0.90
+                wave = 0.5 + 0.5 * np.sin(phase)
+                levels[idx] = (0.28 + 0.72 * wave) * B
+            if t > 0.82:
+                levels *= (1.0 - (t - 0.82) / 0.18)
+
+        elif effect_type == TransitionEffectType.ALTERNATE:
+            hz    = 3.5 + beat_norm * 6.0 + kick_strength * 2.5
+            phase = (int(t * hz * 2.0) % 2) == 0
+            levels[:] = 0.22 * B
+            if phase:
+                levels[0] = B; levels[2] = B
+                levels[1] = 0.32 * B; levels[3] = 0.32 * B
+            else:
+                levels[1] = B; levels[3] = B
+                levels[0] = 0.32 * B; levels[2] = 0.32 * B
+            if t > 0.78:
+                levels *= (1.0 - (t - 0.78) / 0.22)
+
+        elif effect_type == TransitionEffectType.RIPPLE:
+            center_peak = float(np.exp(-((t - 0.22) / 0.20) ** 2))
+            edge_peak   = float(np.exp(-((t - 0.56) / 0.22) ** 2))
+            tail        = float(np.exp(-((t - 0.84) / 0.16) ** 2))
+            levels[1] = B * (0.80 * center_peak + 0.20 * tail)
+            levels[2] = B * (0.80 * center_peak + 0.20 * tail)
+            levels[0] = B * (0.85 * edge_peak + 0.15 * tail)
+            levels[3] = B * (0.85 * edge_peak + 0.15 * tail)
 
         elif effect_type == TransitionEffectType.PING_PONG:
             raw = (t * 3.0) % 2.0
@@ -1293,30 +1414,47 @@ class MusicLEDController:
         p90_energy = 1e-9
         p95_low    = 1e-9
 
-        # ---- BPM resync: grid de batidas reais (librosa) --------------- #
+        # ---- BPM resync: grid rítmico para steps do meio ---------------- #
         # Converte beat_times → beat_frame_indices no espaço da partitura
         beat_frame_set = set(int(np.clip(bf, 0, n_frames - 1)) for bf in beat_frames)
-        # Sorted list para busca do próximo beat
         beat_frame_sorted = sorted(beat_frame_set)
         _bf_len = len(beat_frame_sorted)
+        grid_anchor_frame = beat_frame_sorted[0] if _bf_len > 0 else 0
+        track_seconds = max(n_frames / float(self.fps), 1e-6)
+        expected_beats = max(1.0, track_seconds * max(tempo_bpm, 1.0) / 60.0)
+        beat_coverage = float(np.clip(_bf_len / expected_beats, 0.0, 1.6))
+        cont_sync_strength = float(np.clip(
+            cfg.BPM_CONTINUOUS_SYNC_STRENGTH * (0.65 + 0.90 * beat_coverage),
+            0.015, 0.14,
+        ))
+        resync_strength = float(np.clip(
+            cfg.BPM_RESYNC_STRENGTH * (0.70 + 0.35 * beat_coverage),
+            0.35, 0.98,
+        ))
+        log_sub(
+            "Sync automático: "
+            f"cont={_c(f'{cont_sync_strength:.3f}', C.BCYAN)}  "
+            f"pós={_c(f'{resync_strength:.3f}', C.BCYAN)}  "
+            f"cobertura={_c(f'{beat_coverage:.2f}', C.BYELLOW)}"
+        )
 
-        def _next_beat_phase(current_frame: int) -> float:
+        def _next_grid_phase(current_frame: int) -> float:
             """Retorna a fase [0,1) que o phase_accumulator deveria ter
-               para disparar o próximo step exatamente no próximo beat."""
-            # Busca binária do próximo beat >= current_frame
-            lo, hi = 0, _bf_len
-            while lo < hi:
-                mid = (lo + hi) // 2
-                if beat_frame_sorted[mid] < current_frame:
-                    lo = mid + 1
-                else:
-                    hi = mid
-            if lo >= _bf_len:
-                return phase_accumulator  # fim da música, não altera
-            frames_to_beat = beat_frame_sorted[lo] - current_frame
-            # Queremos que o acumulador chegue a 1.0 em exatamente frames_to_beat frames
-            ideal = float(np.clip(1.0 - frames_to_beat * base_speed, 0.0, 1.0))
+               para disparar o próximo step alinhado ao grid da batida."""
+            if _bf_len == 0 or base_step_frames <= 1:
+                return phase_accumulator
+            if current_frame <= grid_anchor_frame:
+                frames_to_grid = grid_anchor_frame - current_frame
+            else:
+                frames_from_anchor = (current_frame - grid_anchor_frame) % base_step_frames
+                frames_to_grid = (
+                    0 if frames_from_anchor == 0 else (base_step_frames - frames_from_anchor)
+                )
+            ideal = float(np.clip(1.0 - frames_to_grid * base_speed, 0.0, 1.0))
             return ideal
+
+        if _bf_len > 0:
+            phase_accumulator = _next_grid_phase(0)
 
         for i in range(n_frames):
             # ---- áudio deste frame ----------------------------------- #
@@ -1384,6 +1522,16 @@ class MusicLEDController:
 
             # ---- avança sequência do meio (sempre, mesmo em transição) #
             phase_accumulator += base_speed
+            if (
+                active_trans is None
+                and cont_sync_strength > 0.0
+                and _bf_len > 0
+            ):
+                ideal = _next_grid_phase(i)
+                phase_accumulator = (
+                    phase_accumulator * (1.0 - cont_sync_strength)
+                    + ideal * cont_sync_strength
+                )
             while phase_accumulator >= 1.0:
                 phase_accumulator -= 1.0
                 prev_active_mid  = active_mid
@@ -1455,11 +1603,11 @@ class MusicLEDController:
                     active_trans  = None
                     middle_levels *= 0.55
                     # ---- ressincroniza fase ao grid de batidas -------- #
-                    if cfg.BPM_RESYNC_STRENGTH > 0.0 and _bf_len > 0:
-                        ideal = _next_beat_phase(i)
+                    if resync_strength > 0.0 and _bf_len > 0:
+                        ideal = _next_grid_phase(i)
                         phase_accumulator = (
-                            phase_accumulator * (1.0 - cfg.BPM_RESYNC_STRENGTH)
-                            + ideal * cfg.BPM_RESYNC_STRENGTH
+                            phase_accumulator * (1.0 - resync_strength)
+                            + ideal * resync_strength
                         )
 
             else:
@@ -1882,16 +2030,69 @@ class MusicLEDController:
 # UI / entrada
 # ---------------------------------------------------------------------------
 
-def select_audio_file():
+def _get_qt_app_dark():
+    global _QT_ENV_CONFIGURED
+    if not _QT_ENV_CONFIGURED:
+        # Evita warning repetido do Qt em sessões GNOME/Wayland e
+        # mantém fallback para X11 caso plugin wayland não esteja disponível.
+        if os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland":
+            os.environ.setdefault("QT_QPA_PLATFORM", "wayland;xcb")
+        _QT_ENV_CONFIGURED = True
+
     try:
-        from PySide6.QtWidgets import QApplication, QFileDialog
+        from PyQt5.QtCore import Qt
+        from PyQt5.QtGui import QColor, QPalette
+        from PyQt5.QtWidgets import QApplication
     except Exception:
-        log_err("PySide6 não encontrado. Instale com: pip install PySide6")
-        return None
+        log_err("PyQt5 não encontrado. Instale com: pip install PyQt5")
+        return None, False
+
     app = QApplication.instance()
     owns_app = app is None
     if owns_app:
         app = QApplication(sys.argv)
+
+    if app and not app.property("_dark_theme_applied"):
+        app.setStyle("Fusion")
+
+        palette = QPalette()
+        palette.setColor(QPalette.Window, QColor(45, 45, 45))
+        palette.setColor(QPalette.WindowText, QColor(220, 220, 220))
+        palette.setColor(QPalette.Base, QColor(30, 30, 30))
+        palette.setColor(QPalette.AlternateBase, QColor(50, 50, 50))
+        palette.setColor(QPalette.ToolTipBase, QColor(20, 20, 20))
+        palette.setColor(QPalette.ToolTipText, QColor(220, 220, 220))
+        palette.setColor(QPalette.Text, QColor(220, 220, 220))
+        palette.setColor(QPalette.Button, QColor(55, 55, 55))
+        palette.setColor(QPalette.ButtonText, QColor(220, 220, 220))
+        palette.setColor(QPalette.BrightText, Qt.red)
+        palette.setColor(QPalette.Link, QColor(42, 130, 218))
+        palette.setColor(QPalette.Highlight, QColor(42, 130, 218))
+        palette.setColor(QPalette.HighlightedText, Qt.black)
+        app.setPalette(palette)
+        app.setStyleSheet(
+            """
+            QToolTip {
+                color: #dcdcdc;
+                background-color: #202020;
+                border: 1px solid #4a4a4a;
+            }
+            """
+        )
+        app.setProperty("_dark_theme_applied", True)
+
+    return app, owns_app
+
+
+def select_audio_file():
+    try:
+        from PyQt5.QtWidgets import QFileDialog
+    except Exception:
+        log_err("PyQt5 não encontrado. Instale com: pip install PyQt5")
+        return None
+    app, owns_app = _get_qt_app_dark()
+    if app is None:
+        return None
     filters = (
         "Arquivos de áudio (*.mp3 *.wav *.flac *.ogg *.m4a *.aac);;"
         "Todos os arquivos (*)"
@@ -1906,14 +2107,13 @@ def select_audio_file():
 
 def select_audio_source():
     try:
-        from PySide6.QtWidgets import QApplication, QInputDialog
+        from PyQt5.QtWidgets import QInputDialog
     except Exception:
-        log_err("PySide6 não encontrado. Instale com: pip install PySide6")
+        log_err("PyQt5 não encontrado. Instale com: pip install PyQt5")
         return None
-    app = QApplication.instance()
-    owns_app = app is None
-    if owns_app:
-        app = QApplication(sys.argv)
+    app, owns_app = _get_qt_app_dark()
+    if app is None:
+        return None
     options = ["Arquivo local", "Buscar no YouTube (yt-dlp)"]
     choice, ok = QInputDialog.getItem(
         None, "Fonte do áudio", "Escolha de onde carregar o áudio:", options, 0, False,
@@ -1939,14 +2139,13 @@ def select_audio_source():
 
 def select_middle_led_speed_multiplier():
     try:
-        from PySide6.QtWidgets import QApplication, QInputDialog
+        from PyQt5.QtWidgets import QInputDialog
     except Exception:
-        log_err("PySide6 não encontrado. Instale com: pip install PySide6")
+        log_err("PyQt5 não encontrado. Instale com: pip install PyQt5")
         return None
-    app = QApplication.instance()
-    owns_app = app is None
-    if owns_app:
-        app = QApplication(sys.argv)
+    app, owns_app = _get_qt_app_dark()
+    if app is None:
+        return None
     options = ["Mais lento (1x BPM)", "Mais rápido (2x BPM)"]
     choice, ok = QInputDialog.getItem(
         None,
@@ -1963,16 +2162,128 @@ def select_middle_led_speed_multiplier():
     return 1.0 if choice == options[0] else 2.0
 
 
+def select_transition_density_profile():
+    try:
+        from PyQt5.QtWidgets import QInputDialog
+    except Exception:
+        log_err("PyQt5 não encontrado. Instale com: pip install PyQt5")
+        return None
+    app, owns_app = _get_qt_app_dark()
+    if app is None:
+        return None
+    options = [
+        "Baixa (menos transições)",
+        "Equilibrada",
+        "Alta (mais transições)",
+    ]
+    choice, ok = QInputDialog.getItem(
+        None,
+        "Quantidade de transições",
+        "Escolha a quantidade de transições:",
+        options,
+        1,
+        False,
+    )
+    if owns_app:
+        app.quit()
+    if not ok:
+        return None
+    if choice == options[0]:
+        return "low"
+    if choice == options[2]:
+        return "high"
+    return "medium"
+
+
+def select_effect_aggressiveness_profile():
+    try:
+        from PyQt5.QtWidgets import QInputDialog
+    except Exception:
+        log_err("PyQt5 não encontrado. Instale com: pip install PyQt5")
+        return None
+    app, owns_app = _get_qt_app_dark()
+    if app is None:
+        return None
+    options = [
+        "Suave",
+        "Equilibrada",
+        "Agressiva",
+    ]
+    choice, ok = QInputDialog.getItem(
+        None,
+        "Agressividade dos efeitos",
+        "Escolha a agressividade dos efeitos:",
+        options,
+        1,
+        False,
+    )
+    if owns_app:
+        app.quit()
+    if not ok:
+        return None
+    if choice == options[0]:
+        return "low"
+    if choice == options[2]:
+        return "high"
+    return "medium"
+
+
+def build_runtime_config(
+    transition_profile: str = "medium",
+    effect_profile: str = "medium",
+) -> EffectConfig:
+    cfg = EffectConfig()
+    overrides = {}
+
+    if transition_profile == "low":
+        overrides.update({
+            "SEG_K_SEGMENTS": 42,
+            "SEG_MIN_GAP_SECONDS": 2.1,
+            "SEG_NOVELTY_THRESHOLD": 0.20,
+            "SEG_STRUCT_CHANGE_THRESHOLD": 0.12,
+        })
+    elif transition_profile == "high":
+        overrides.update({
+            "SEG_K_SEGMENTS": 74,
+            "SEG_MIN_GAP_SECONDS": 0.95,
+            "SEG_NOVELTY_THRESHOLD": 0.13,
+            "SEG_STRUCT_CHANGE_THRESHOLD": 0.08,
+        })
+
+    if effect_profile == "low":
+        overrides.update({
+            "ACTIVE_MAX_PWM": 172.0,
+            "BEAT_BOOST_PWM": 18.0,
+            "MIDDLE_KICK_BRIGHT_GAIN": 95.0,
+            "MIDDLE_STRONG_KICK_BRIGHT_GAIN": 52.0,
+            "EDGE_PULSE_GAIN": 135.0,
+            "NOISE_FLATNESS_THRESHOLD": 0.62,
+            "BRIGHT_CENTROID_THRESHOLD": 0.26,
+        })
+    elif effect_profile == "high":
+        overrides.update({
+            "ACTIVE_MAX_PWM": 220.0,
+            "BEAT_BOOST_PWM": 38.0,
+            "MIDDLE_KICK_BRIGHT_GAIN": 150.0,
+            "MIDDLE_STRONG_KICK_BRIGHT_GAIN": 85.0,
+            "EDGE_PULSE_GAIN": 190.0,
+            "NOISE_FLATNESS_THRESHOLD": 0.48,
+            "BRIGHT_CENTROID_THRESHOLD": 0.18,
+            "TRANS_BLEND_FRAMES": 4,
+        })
+
+    return replace(cfg, **overrides) if overrides else cfg
+
+
 def select_show_youtube_video_in_terminal():
     try:
-        from PySide6.QtWidgets import QApplication, QInputDialog
+        from PyQt5.QtWidgets import QInputDialog
     except Exception:
-        log_err("PySide6 não encontrado. Instale com: pip install PySide6")
+        log_err("PyQt5 não encontrado. Instale com: pip install PyQt5")
         return None
-    app = QApplication.instance()
-    owns_app = app is None
-    if owns_app:
-        app = QApplication(sys.argv)
+    app, owns_app = _get_qt_app_dark()
+    if app is None:
+        return None
     options = ["Não", "Sim"]
     choice, ok = QInputDialog.getItem(
         None,
@@ -2061,6 +2372,33 @@ def main():
     speed_label = "mais rápido (2x BPM)" if middle_speed_mult > 1.0 else "mais lento (padrão)"
     log_ok(f"Velocidade dos LEDs do meio: {_c(speed_label, C.BYELLOW)}")
 
+    transition_profile = select_transition_density_profile()
+    if transition_profile is None:
+        log_warn("Nenhuma configuração de transições selecionada. Encerrando.")
+        return
+    transition_label = {
+        "low": "baixa",
+        "medium": "equilibrada",
+        "high": "alta",
+    }.get(transition_profile, "equilibrada")
+    log_ok(f"Quantidade de transições: {_c(transition_label, C.BYELLOW)}")
+
+    effect_profile = select_effect_aggressiveness_profile()
+    if effect_profile is None:
+        log_warn("Nenhuma agressividade de efeitos selecionada. Encerrando.")
+        return
+    effect_label = {
+        "low": "suave",
+        "medium": "equilibrada",
+        "high": "agressiva",
+    }.get(effect_profile, "equilibrada")
+    log_ok(f"Agressividade dos efeitos: {_c(effect_label, C.BYELLOW)}")
+
+    runtime_config = build_runtime_config(
+        transition_profile=transition_profile,
+        effect_profile=effect_profile,
+    )
+
     source_type, source_value = selection
     show_youtube_video = False
     youtube_video_source = None
@@ -2088,6 +2426,7 @@ def main():
     controller = MusicLEDController(
         port=arduino_port,
         fps=30,
+        config=runtime_config,
         middle_bpm_multiplier=middle_speed_mult,
         show_youtube_video=show_youtube_video,
     )
