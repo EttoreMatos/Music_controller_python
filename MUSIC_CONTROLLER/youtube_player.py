@@ -1171,16 +1171,16 @@ def _play_watch_mode(
     return "done"
 
 
-# ─── GUI (PySide6) ────────────────────────────────────────────────────────────
+# ─── GUI (PyQt5) ────────────────────────────────────────────────────────────
 
 def _gui_get_queries() -> list:
     try:
-        from PySide6.QtWidgets import (  # type: ignore
+        from PyQt5.QtWidgets import (  # type: ignore
             QApplication, QDialog, QVBoxLayout, QLabel, QTextEdit, QPushButton,
         )
-        from PySide6.QtCore import Qt  # type: ignore
+        from PyQt5.QtCore import Qt  # type: ignore
     except Exception:
-        log_err("PySide6 não encontrado. Instale: pip install PySide6")
+        log_err("PyQt5 não encontrado. Instale: pip install PyQt5")
         return []
 
     app = QApplication.instance() or QApplication(sys.argv)
@@ -1213,9 +1213,9 @@ def _gui_get_queries() -> list:
 
 def _gui_select_mode() -> Optional[str]:
     try:
-        from PySide6.QtWidgets import QApplication, QInputDialog  # type: ignore
+        from PyQt5.QtWidgets import QApplication, QInputDialog  # type: ignore
     except Exception:
-        log_err("PySide6 não encontrado.")
+        log_err("PyQt5 não encontrado.")
         return None
     app     = QApplication.instance() or QApplication(sys.argv)
     options = ["Somente ouvir", "Ver + ouvir"]

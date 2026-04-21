@@ -2030,6 +2030,7 @@ class MusicLEDController:
 # UI / entrada
 # ---------------------------------------------------------------------------
 
+
 def _get_qt_app_dark():
     global _QT_ENV_CONFIGURED
     if not _QT_ENV_CONFIGURED:
