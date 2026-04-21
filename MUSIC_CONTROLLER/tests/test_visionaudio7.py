@@ -1,5 +1,6 @@
 import os
 import unittest
+from unittest import mock
 from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -10,7 +11,9 @@ from PyQt5.QtWidgets import QApplication
 from visionaudio7 import (
     CONTROL_SPECS,
     EffectConfigCompat,
+    GenerationService,
     GeneratedSequence,
+    LoadWorker,
     LoadedTrack,
     ParameterRecommendationService,
     RecommendationResult,
@@ -143,6 +146,44 @@ class FakeGenerationService:
         )
 
 
+class FailingSourceResolver:
+    def load(self, _source_mode: str, _source_value: str):
+        raise RuntimeError()
+
+
+class FailingHardwareController(FakeHardwareController):
+    def connect_port(self, _port: str, baudrate: int = 115200) -> None:
+        raise RuntimeError()
+
+
+class KeywordOnlyPeakPick:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def __call__(self, onset_env, *, pre_max, post_max, pre_avg, post_avg, delta, wait):
+        self.calls.append(
+            {
+                "onset_env": onset_env,
+                "pre_max": pre_max,
+                "post_max": post_max,
+                "pre_avg": pre_avg,
+                "post_avg": post_avg,
+                "delta": delta,
+                "wait": wait,
+            }
+        )
+        return [1, 4]
+
+
+class PositionalOnlyPeakPick:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def __call__(self, onset_env, pre_max, post_max, pre_avg, post_avg, delta, wait, /):
+        self.calls.append((onset_env, pre_max, post_max, pre_avg, post_avg, delta, wait))
+        return [2, 5, 8]
+
+
 class VisionAudioTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -197,6 +238,30 @@ class VisionAudioTests(unittest.TestCase):
         self.assertIn(result.categorical_values["effect_profile"], {"low", "medium", "high"})
         self.assertIn(result.categorical_values["middle_speed_multiplier"], {1.0, 2.0})
 
+    def test_peak_pick_helper_supports_keyword_only_signature(self):
+        peak_pick = KeywordOnlyPeakPick()
+        librosa_module = SimpleNamespace(util=SimpleNamespace(peak_pick=peak_pick))
+        service = GenerationService()
+
+        result = service._peak_pick_onsets(librosa_module, [0.1, 0.4, 0.8])
+
+        self.assertEqual(result, [1, 4])
+        self.assertEqual(len(peak_pick.calls), 1)
+        self.assertEqual(peak_pick.calls[0]["pre_max"], 3)
+        self.assertEqual(peak_pick.calls[0]["wait"], 5)
+
+    def test_peak_pick_helper_falls_back_to_positional_signature(self):
+        peak_pick = PositionalOnlyPeakPick()
+        librosa_module = SimpleNamespace(util=SimpleNamespace(peak_pick=peak_pick))
+        service = GenerationService()
+
+        result = service._peak_pick_onsets(librosa_module, [0.2, 0.6, 0.9])
+
+        self.assertEqual(result, [2, 5, 8])
+        self.assertEqual(len(peak_pick.calls), 1)
+        self.assertEqual(peak_pick.calls[0][1:], (3, 3, 3, 5, 0.5, 5))
+        self.assertGreater(float(len(result)) / (30.0 / 60.0), 0.0)
+
     def test_window_flow_loaded_recommended_generated_and_playing(self):
         playback = FakePlaybackController()
         hardware = FakeHardwareController()
@@ -242,6 +307,111 @@ class VisionAudioTests(unittest.TestCase):
         window.stop_playback()
         self.assertEqual(playback.stop_calls, 1)
         self.assertEqual(window.player_state_label.text(), "Idle")
+        window.close()
+
+    def test_layout_uses_splitters_and_preview_panel_is_retractable(self):
+        window = VisionAudioWindow(
+            source_resolver=FakeSourceResolver(),
+            generation_service=FakeGenerationService(),
+            recommendation_service=ParameterRecommendationService(),
+            playback_controller=FakePlaybackController(),
+            hardware_controller=FakeHardwareController(),
+        )
+        window.show()
+        window._configure_initial_splitters()
+        self.app.processEvents()
+
+        self.assertEqual(window.content_splitter.objectName(), "MainContentSplitter")
+        self.assertEqual(window.monitor_splitter.objectName(), "MonitorSplitter")
+        self.assertFalse(hasattr(window, "preview_toggle_button"))
+        self.assertEqual(window.preview_panel.minimumWidth(), 0)
+        initial_sizes = window.content_splitter.sizes()
+        self.assertGreater(initial_sizes[2], 0)
+
+        window.content_splitter.setSizes([260, 920, 0])
+        self.app.processEvents()
+        collapsed_sizes = window.content_splitter.sizes()
+        self.assertEqual(collapsed_sizes[2], 0)
+
+        window.content_splitter.setSizes([260, 700, 320])
+        self.app.processEvents()
+        expanded_sizes = window.content_splitter.sizes()
+        self.assertGreater(expanded_sizes[2], 0)
+        window.close()
+
+    def test_logs_panel_has_taller_defaults(self):
+        window = VisionAudioWindow(
+            source_resolver=FakeSourceResolver(),
+            generation_service=FakeGenerationService(),
+            recommendation_service=ParameterRecommendationService(),
+            playback_controller=FakePlaybackController(),
+            hardware_controller=FakeHardwareController(),
+        )
+        window.show()
+        window._configure_initial_splitters()
+        self.app.processEvents()
+
+        self.assertGreaterEqual(window.log_output.minimumHeight(), 120)
+        self.assertEqual(window.log_output.maximumHeight(), 220)
+        self.assertGreaterEqual(window.log_output.parentWidget().minimumHeight(), 180)
+        self.assertEqual(window.log_output.parentWidget().maximumHeight(), 280)
+        splitter_sizes = window.monitor_splitter.sizes()
+        self.assertGreater(splitter_sizes[1], splitter_sizes[0])
+        window.close()
+
+    def test_load_worker_error_emits_message_and_details(self):
+        worker = LoadWorker(FailingSourceResolver(), "local", "/tmp/invalido.wav")
+        received = []
+        worker.failed.connect(lambda message, details: received.append((message, details)))
+
+        worker.run()
+
+        self.assertEqual(len(received), 1)
+        message, details = received[0]
+        self.assertTrue(message)
+        self.assertIn("RuntimeError", message)
+        self.assertTrue(details)
+
+    def test_worker_error_popup_receives_non_empty_message_and_details(self):
+        window = VisionAudioWindow(
+            source_resolver=FakeSourceResolver(),
+            generation_service=FakeGenerationService(),
+            recommendation_service=ParameterRecommendationService(),
+            playback_controller=FakePlaybackController(),
+            hardware_controller=FakeHardwareController(),
+        )
+
+        with mock.patch("visionaudio7.qt_message") as qt_message_mock:
+            window._handle_worker_error("", "traceback line")
+
+        args = qt_message_mock.call_args.args
+        self.assertEqual(args[1], "VisionAudio7")
+        self.assertTrue(args[2])
+        self.assertEqual(args[4], "traceback line")
+        window.close()
+
+    def test_connection_and_playback_errors_use_visible_messages(self):
+        window = VisionAudioWindow(
+            source_resolver=FakeSourceResolver(),
+            generation_service=FakeGenerationService(),
+            recommendation_service=ParameterRecommendationService(),
+            playback_controller=FakePlaybackController(),
+            hardware_controller=FailingHardwareController(),
+        )
+        window.port_combo.setEditText("/dev/ttyACM0")
+
+        with mock.patch("visionaudio7.qt_message") as qt_message_mock:
+            window.toggle_connection()
+            window._on_playback_error("")
+
+        first_call = qt_message_mock.call_args_list[0].args
+        second_call = qt_message_mock.call_args_list[1].args
+        self.assertEqual(first_call[1], "Arduino")
+        self.assertTrue(first_call[2])
+        self.assertIn("RuntimeError", first_call[2])
+        self.assertEqual(second_call[1], "Player")
+        self.assertTrue(second_call[2])
+        self.assertIn("PlaybackError", second_call[2])
         window.close()
 
 

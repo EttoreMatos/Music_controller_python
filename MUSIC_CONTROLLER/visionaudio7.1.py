@@ -24,6 +24,7 @@ from PyQt5.QtGui import (
     QColor,
     QFont,
     QLinearGradient,
+    QRadialGradient,
     QPainter,
     QPainterPath,
     QPalette,
@@ -1328,6 +1329,15 @@ class LedPreviewWidget(QWidget):
         super().__init__(parent)
         self.setMinimumHeight(92)
         self._levels = [0] * 6
+        self._anim_phase = 0.0
+        self._anim_timer = QTimer(self)
+        self._anim_timer.setInterval(40)  # 25 fps idle animation
+        self._anim_timer.timeout.connect(self._anim_tick)
+        self._anim_timer.start()
+
+    def _anim_tick(self) -> None:
+        self._anim_phase = (self._anim_phase + 0.07) % (2 * math.pi)
+        self.update()
 
     def set_levels(self, levels: Sequence[int]) -> None:
         values = [0] * 6
@@ -1340,34 +1350,85 @@ class LedPreviewWidget(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         rect = self.rect().adjusted(8, 8, -8, -8)
-        gradient = QLinearGradient(rect.topLeft(), rect.bottomRight())
-        gradient.setColorAt(0.0, QColor("#162033"))
-        gradient.setColorAt(1.0, QColor("#0c111d"))
+
+        # ── Background ──────────────────────────────────────
+        bg = QLinearGradient(0, rect.top(), 0, rect.bottom())
+        bg.setColorAt(0.0, QColor("#1a2b40"))
+        bg.setColorAt(0.5, QColor("#0f1d2e"))
+        bg.setColorAt(1.0, QColor("#07111c"))
         path = QPainterPath()
-        path.addRoundedRect(QRectF(rect), 18, 18)
-        painter.fillPath(path, gradient)
-        painter.setPen(QPen(QColor("#26344f"), 1.2))
+        path.addRoundedRect(QRectF(rect), 20, 20)
+        painter.fillPath(path, bg)
+
+        # ── Top-edge glass highlight ─────────────────────────
+        hl = QLinearGradient(rect.left(), 0, rect.right(), 0)
+        hl.setColorAt(0.0, QColor(80, 140, 210, 0))
+        hl.setColorAt(0.35, QColor(100, 170, 240, 70))
+        hl.setColorAt(0.65, QColor(100, 170, 240, 70))
+        hl.setColorAt(1.0, QColor(80, 140, 210, 0))
+        hl_pen = QPen()
+        hl_pen.setBrush(hl)
+        hl_pen.setWidthF(1.5)
+        painter.setPen(hl_pen)
+        painter.drawLine(int(rect.left() + 22), int(rect.top()), int(rect.right() - 22), int(rect.top()))
+
+        # ── Border ───────────────────────────────────────────
+        painter.setPen(QPen(QColor("#253d58"), 1.2))
         painter.drawPath(path)
-        width = rect.width() / 6.0
+
+        # ── LEDs ─────────────────────────────────────────────
+        any_active = any(v > 8 for v in self._levels)
+        w = rect.width() / 6.0
         for idx, level in enumerate(self._levels):
-            center = QPointF(rect.left() + width * (idx + 0.5), rect.center().y())
-            radius = min(width * 0.32, rect.height() * 0.28)
-            intensity = level / 255.0
-            base_color = QColor("#f7a63d") if idx in (0, 5) else QColor("#3bd5ff")
-            glow = QColor(base_color)
-            glow.setAlphaF(0.12 + 0.55 * intensity)
-            painter.setBrush(Qt.NoBrush)
+            cx = rect.left() + w * (idx + 0.5)
+            cy = rect.center().y() - 3
+            center = QPointF(cx, cy)
+            radius = min(w * 0.31, rect.height() * 0.28)
+            is_edge = idx in (0, 5)
+            base_color = QColor("#f79435") if is_edge else QColor("#28c8f8")
+
+            if any_active:
+                raw_level = level / 255.0
+                intensity = min(1.0, (raw_level ** 0.82) * 1.18)
+                glow_strength = min(1.0, raw_level * 1.32 + 0.08) if level > 0 else 0.0
+            else:
+                offset = idx * (math.pi / 3.0)
+                intensity = (math.sin(self._anim_phase + offset) + 1.0) * 0.5 * 0.18
+                glow_strength = intensity
+
             painter.setPen(Qt.NoPen)
-            for ring in range(3, 0, -1):
-                scale = 1.0 + ring * 0.35
-                painter.setBrush(QColor(glow))
+
+            # Outer diffuse glow layers
+            for ring in range(7, 0, -1):
+                scale = 1.0 + ring * 0.46
+                alpha = int(max(0, min(255, (0.05 + 0.16 * glow_strength) * (8 - ring) / 7 * 255)))
+                gc = QColor(base_color)
+                gc.setAlpha(alpha)
+                painter.setBrush(gc)
                 painter.drawEllipse(center, radius * scale, radius * scale)
-            fill = QColor(base_color)
-            fill = fill.lighter(int(100 + intensity * 55))
-            painter.setBrush(fill)
+
+            # Flat LED body with a brighter inner disc, no 3-D specular shading.
+            flat_fill = QColor(base_color).lighter(int(118 + intensity * 55))
+            painter.setBrush(flat_fill)
             painter.drawEllipse(center, radius, radius)
-            painter.setPen(QPen(QColor("#f5f7fb"), 1.4))
+
+            if intensity > 0.02:
+                inner_fill = QColor(base_color).lighter(int(150 + intensity * 50))
+                inner_fill.setAlpha(int(180 + intensity * 55))
+                painter.setBrush(inner_fill)
+                painter.drawEllipse(center, radius * 0.62, radius * 0.62)
+
+            # Simple outline to keep the disc readable.
+            rim = QColor(base_color).lighter(125)
+            rim.setAlpha(int(95 + intensity * 70))
+            painter.setPen(QPen(rim, 0.95))
+            painter.setBrush(Qt.NoBrush)
             painter.drawEllipse(center, radius, radius)
+
+            # Index label
+            painter.setPen(QColor(90, 140, 190, 100))
+            painter.setFont(QFont("DejaVu Sans", 6))
+            painter.drawText(QRectF(cx - 10, rect.bottom() - 14, 20, 12), Qt.AlignCenter, str(idx + 1))
 
 
 class TimelineWidget(QWidget):
@@ -1378,6 +1439,16 @@ class TimelineWidget(QWidget):
         self.transitions: List[Any] = []
         self.duration_s = 0.0
         self.position_s = 0.0
+        self._ph_phase = 0.0
+        self._ph_timer = QTimer(self)
+        self._ph_timer.setInterval(40)
+        self._ph_timer.timeout.connect(self._ph_tick)
+        self._ph_timer.start()
+
+    def _ph_tick(self) -> None:
+        self._ph_phase = (self._ph_phase + 0.10) % (2 * math.pi)
+        if self.duration_s > 0:
+            self.update()
 
     def set_sequence(self, sequence: Optional[GeneratedSequence]) -> None:
         if sequence is None:
@@ -1399,41 +1470,118 @@ class TimelineWidget(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         rect = self.rect().adjusted(8, 8, -8, -8)
-        gradient = QLinearGradient(rect.topLeft(), rect.bottomRight())
-        gradient.setColorAt(0.0, QColor("#111827"))
-        gradient.setColorAt(1.0, QColor("#09111b"))
-        painter.setBrush(gradient)
-        painter.setPen(QPen(QColor("#24334d"), 1.2))
-        painter.drawRoundedRect(rect, 18, 18)
+
+        # ── Background ─────────────────────────────────────
+        bg = QLinearGradient(0, rect.top(), 0, rect.bottom())
+        bg.setColorAt(0.0, QColor("#141f2e"))
+        bg.setColorAt(0.5, QColor("#0e1824"))
+        bg.setColorAt(1.0, QColor("#08111a"))
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(rect), 18, 18)
+        painter.fillPath(path, bg)
+
+        # ── Top highlight ──────────────────────────────────
+        hl = QLinearGradient(rect.left(), 0, rect.right(), 0)
+        hl.setColorAt(0.0, QColor(60, 120, 180, 0))
+        hl.setColorAt(0.4, QColor(80, 150, 210, 55))
+        hl.setColorAt(0.6, QColor(80, 150, 210, 55))
+        hl.setColorAt(1.0, QColor(60, 120, 180, 0))
+        hl_pen = QPen()
+        hl_pen.setBrush(hl)
+        hl_pen.setWidthF(1.4)
+        painter.setPen(hl_pen)
+        painter.drawLine(int(rect.left() + 20), int(rect.top()), int(rect.right() - 20), int(rect.top()))
+
+        painter.setPen(QPen(QColor("#1e3248"), 1.2))
+        painter.drawPath(path)
+
         if not self.preview_columns:
-            painter.setPen(QColor("#7b8ba7"))
-            painter.drawText(rect, Qt.AlignCenter, "Preview da sequencia aparece aqui")
+            painter.setPen(QColor("#6b7e96"))
+            painter.setFont(QFont("DejaVu Sans", 10))
+            painter.drawText(QRectF(rect), Qt.AlignCenter, "Preview da sequência aparece aqui")
             return
-        inner = rect.adjusted(18, 20, -18, -24)
-        column_width = max(1.8, inner.width() / max(len(self.preview_columns), 1))
-        for idx, levels in enumerate(self.preview_columns):
-            avg = sum(levels) / max(1, len(levels))
-            ratio = avg / 255.0
-            bar_height = inner.height() * ratio
-            x = inner.left() + idx * column_width
-            bar = QRectF(x, inner.bottom() - bar_height, max(1.0, column_width - 1.2), bar_height)
-            color = QColor("#4fd1ff")
-            color.setAlphaF(0.14 + 0.72 * ratio)
-            painter.fillRect(bar, color)
-        painter.setPen(QPen(QColor("#f59e0b"), 1.2))
+
+        inner = rect.adjusted(16, 22, -16, -22)
+
+        # ── Time ruler ─────────────────────────────────────
+        if self.duration_s > 0:
+            ruler_y = rect.top() + 5
+            ruler_h = 13
+            n_marks = min(8, max(2, int(self.duration_s // 30)))
+            if n_marks < 2:
+                n_marks = 4
+            painter.setFont(QFont("DejaVu Sans", 6))
+            painter.setPen(QColor("#3a5a7a"))
+            for i in range(n_marks + 1):
+                rx = int(inner.left() + inner.width() * i / n_marks)
+                painter.drawLine(rx, int(ruler_y), rx, int(ruler_y + ruler_h))
+                if 0 < i < n_marks:
+                    ts = self.duration_s * i / n_marks
+                    painter.drawText(QRectF(rx - 14, ruler_y, 28, ruler_h), Qt.AlignCenter, format_seconds(ts))
+
+        # ── Waveform bars (colour by intensity) ────────────
+        num_cols = len(self.preview_columns)
+        if num_cols > 0:
+            cw = max(1.5, inner.width() / num_cols)
+            for idx, levels in enumerate(self.preview_columns):
+                avg = sum(levels) / max(1, len(levels))
+                ratio = avg / 255.0
+                bh = inner.height() * ratio
+                bx = inner.left() + idx * cw
+                # Hue: deep blue (low) → cyan (high)
+                hue = 0.58 - ratio * 0.12   # HSV hue: 209° → 169°
+                bar_c = QColor.fromHsvF(hue, 0.72, 0.45 + ratio * 0.55)
+                bar_c.setAlphaF(0.16 + 0.66 * ratio)
+                br = QRectF(bx, inner.bottom() - bh, max(1.2, cw - 0.8), bh)
+                painter.fillRect(br, bar_c)
+                # Bright top-edge cap
+                if bh > 2:
+                    cap_c = QColor.fromHsvF(hue, 0.5, 1.0)
+                    cap_c.setAlphaF(0.50 * ratio)
+                    painter.fillRect(QRectF(bx, inner.bottom() - bh, max(1.2, cw - 0.8), 1.5), cap_c)
+
+        # ── Transition markers ─────────────────────────────
         fps = _CFG.FPS
         for transition in self.transitions:
-            start = float(getattr(transition, "frame_start", 0)) / fps
+            start_s = float(getattr(transition, "frame_start", 0)) / fps
             if self.duration_s <= 0:
                 continue
-            ratio = max(0.0, min(1.0, start / self.duration_s))
-            x = inner.left() + inner.width() * ratio
-            painter.drawLine(int(x), inner.top(), int(x), inner.bottom())
+            tr = max(0.0, min(1.0, start_s / self.duration_s))
+            tx = inner.left() + inner.width() * tr
+            # Dashed vertical line
+            painter.setPen(QPen(QColor(245, 158, 11, 110), 1.0, Qt.DashLine))
+            painter.drawLine(int(tx), int(inner.top()), int(tx), int(inner.bottom()))
+            # Diamond top marker
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor("#f59e0b"))
+            dm = QPainterPath()
+            dm.moveTo(tx, inner.top() - 2)
+            dm.lineTo(tx + 4, inner.top() + 5)
+            dm.lineTo(tx, inner.top() + 10)
+            dm.lineTo(tx - 4, inner.top() + 5)
+            dm.closeSubpath()
+            painter.drawPath(dm)
+
+        # ── Playhead (animated glow) ───────────────────────
         if self.duration_s > 0:
-            ratio = max(0.0, min(1.0, self.position_s / self.duration_s))
-            x = inner.left() + inner.width() * ratio
-            painter.setPen(QPen(QColor("#f5f7fb"), 2.2))
-            painter.drawLine(int(x), rect.top() + 10, int(x), rect.bottom() - 10)
+            pr = max(0.0, min(1.0, self.position_s / self.duration_s))
+            px = inner.left() + inner.width() * pr
+            g_alpha = int(30 + 22 * math.sin(self._ph_phase))
+            for rw in range(10, 0, -2):
+                gc = QColor(240, 248, 255, int(g_alpha * rw / 10))
+                painter.setPen(QPen(gc, float(rw)))
+                painter.drawLine(int(px), int(rect.top() + 10), int(px), int(rect.bottom() - 10))
+            painter.setPen(QPen(QColor("#eef4fc"), 2.0))
+            painter.drawLine(int(px), int(rect.top() + 10), int(px), int(rect.bottom() - 10))
+            # Triangle head
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor("#eef4fc"))
+            tri = QPainterPath()
+            tri.moveTo(px - 5, rect.top() + 8)
+            tri.lineTo(px + 5, rect.top() + 8)
+            tri.lineTo(px, rect.top() + 16)
+            tri.closeSubpath()
+            painter.drawPath(tri)
 
 
 class VerticalControl(QFrame):
@@ -1495,8 +1643,12 @@ class VerticalControl(QFrame):
             self.setStyleSheet(
                 """
                 QFrame#VerticalControl {
-                    background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #263246, stop:0.38 #1a2232, stop:1 #0e131d);
-                    border: 1px solid #4fd1ff;
+                    background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+                        stop:0 #1e3246, stop:0.38 #162535, stop:1 #0c1520);
+                    border-top: 2px solid #40d4ff;
+                    border-left: 1px solid #28a8d8;
+                    border-right: 1px solid #1a7898;
+                    border-bottom: 1px solid #104858;
                     border-radius: 20px;
                 }
                 """
@@ -1505,8 +1657,12 @@ class VerticalControl(QFrame):
             self.setStyleSheet(
                 """
                 QFrame#VerticalControl {
-                    background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #2d3747, stop:0.36 #171f2c, stop:1 #0b1018);
-                    border: 1px solid #2a3445;
+                    background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+                        stop:0 #222e40, stop:0.36 #141e2e, stop:1 #090f1a);
+                    border-top: 1px solid #384f68;
+                    border-left: 1px solid #28394e;
+                    border-right: 1px solid #1a2838;
+                    border-bottom: 1px solid #10182a;
                     border-radius: 20px;
                 }
                 """
@@ -1589,105 +1745,188 @@ class VisionAudioWindow(QMainWindow):
         self._set_status_badge("ready")
         self._update_controls_enabled()
         self.log("VisionAudio7 pronto.")
+        # Startup fade-in animation
+        self.setWindowOpacity(0.0)
+        QTimer.singleShot(60, self._start_fade_in)
 
     def _apply_theme(self) -> None:
         self.setFont(QFont("DejaVu Sans", 9))
         palette = self.palette()
-        palette.setColor(QPalette.Window, QColor("#0b1118"))
-        palette.setColor(QPalette.Base, QColor("#101923"))
-        palette.setColor(QPalette.AlternateBase, QColor("#13202c"))
-        palette.setColor(QPalette.Text, QColor("#edf3fb"))
-        palette.setColor(QPalette.WindowText, QColor("#edf3fb"))
-        palette.setColor(QPalette.Button, QColor("#1b2430"))
-        palette.setColor(QPalette.ButtonText, QColor("#edf3fb"))
+        palette.setColor(QPalette.Window, QColor("#09101a"))
+        palette.setColor(QPalette.Base, QColor("#0e1923"))
+        palette.setColor(QPalette.AlternateBase, QColor("#121f2d"))
+        palette.setColor(QPalette.Text, QColor("#e8f0fa"))
+        palette.setColor(QPalette.WindowText, QColor("#e8f0fa"))
+        palette.setColor(QPalette.Button, QColor("#182332"))
+        palette.setColor(QPalette.ButtonText, QColor("#e8f0fa"))
         self.setPalette(palette)
         self.setStyleSheet(
             """
             QMainWindow {
-                background: qradialgradient(cx:0.18, cy:0.08, radius:1.05, fx:0.20, fy:0.08,
-                    stop:0 #233245, stop:0.16 #182330, stop:0.45 #101720, stop:1 #070b11);
+                background: qradialgradient(cx:0.18, cy:0.08, radius:1.10,
+                    stop:0 #1e2f44, stop:0.14 #162032, stop:0.40 #0e1826, stop:1 #05090f);
             }
-            QLabel { color: #edf3fb; }
+
+            /* ── Labels ── */
+            QLabel { color: #e8f0fa; }
             QLabel#SectionTitle {
                 font-size: 12px;
                 font-weight: 700;
-                color: #f2c36d;
+                color: #fbc96d;
+                letter-spacing: 0.5px;
             }
             QLabel#SectionMeta {
-                color: #8fa3ba;
+                color: #7b98b5;
                 font-size: 10px;
             }
-            QFrame#Card, QFrame#PlayerBar {
-                background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                    stop:0 #1d2938, stop:0.10 #182331, stop:0.52 #111925, stop:1 #0b121a);
-                border: 1px solid #33455b;
-                border-radius: 18px;
+            QLabel#PlayerTitle {
+                font-size: 13px;
+                font-weight: 700;
+                color: #edf5fd;
+                letter-spacing: 0.3px;
             }
-            QFrame#InsetCard {
-                background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                    stop:0 #101923, stop:1 #0b121a);
-                border: 1px solid #25364a;
-                border-radius: 14px;
-            }
-            QPushButton {
-                background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                    stop:0 #243243, stop:1 #182230);
-                border: 1px solid #42556d;
-                border-radius: 11px;
-                color: #eef4fb;
-                padding: 5px 12px;
-                min-height: 16px;
+            QLabel#PlayerState {
+                font-size: 11px;
+                color: #7090ae;
                 font-weight: 600;
             }
+            QLabel#PositionLabel {
+                font-family: "DejaVu Sans Mono";
+                font-size: 14px;
+                font-weight: 700;
+                color: #e8f0fa;
+                padding: 0 10px;
+                min-width: 116px;
+            }
+
+            /* ── Cards — 3-D bevelled glass panels ── */
+            QFrame#Card, QFrame#PlayerBar {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0.000 #20303f,
+                    stop:0.018 #192835,
+                    stop:0.500 #111d2c,
+                    stop:0.982 #0c1825,
+                    stop:1.000 #08101a);
+                border-top: 1px solid #4e6e8e;
+                border-left: 1px solid #38536a;
+                border-right: 1px solid #263848;
+                border-bottom: 1px solid #182738;
+                border-radius: 20px;
+            }
+            QFrame#InsetCard {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #101922, stop:1 #09111a);
+                border-top: 1px solid #354e66;
+                border-left: 1px solid #263c50;
+                border-right: 1px solid #1b2c3a;
+                border-bottom: 1px solid #141f2c;
+                border-radius: 14px;
+            }
+
+            /* ── Buttons ── */
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #263548, stop:1 #18263a);
+                border-top: 1px solid #4a6682;
+                border-left: 1px solid #384f68;
+                border-right: 1px solid #263848;
+                border-bottom: 1px solid #18293a;
+                border-radius: 11px;
+                color: #ddeaf8;
+                padding: 6px 14px;
+                min-height: 18px;
+                font-weight: 600;
+                font-size: 11px;
+            }
             QPushButton:hover {
-                background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                    stop:0 #2b3d52, stop:1 #1b2939);
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #2e4460, stop:1 #1c3048);
+                border-top-color: #60879f;
+                color: #edf6ff;
             }
             QPushButton:pressed {
-                background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                    stop:0 #14202d, stop:1 #24384d);
-                border-color: #5c7491;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #14202e, stop:1 #1e3245);
+                border-top-color: #253848;
             }
             QPushButton:disabled {
-                background: #151c26;
-                color: #68798d;
-                border-color: #273342;
+                background: #121c28;
+                color: #4a6070;
+                border-color: #1e2d3c;
             }
+
+            /* Primary — amber glow */
             QPushButton[variant="primary"] {
-                background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                    stop:0 #f0a94c, stop:1 #b96c1f);
-                border-color: #f4bb72;
-                color: #fffaf3;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #f5b54e, stop:0.48 #e8932c, stop:1 #c0711e);
+                border-top: 2px solid #fdc96a;
+                border-left: 1px solid #f5b038;
+                border-right: 1px solid #d8861a;
+                border-bottom: 1px solid #a85e10;
+                color: #fff8ee;
+                font-weight: 700;
             }
             QPushButton[variant="primary"]:hover {
-                background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                    stop:0 #f6b967, stop:1 #c57928);
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #fcc468, stop:0.48 #f0a840, stop:1 #d07c22);
+                border-top-color: #ffe090;
             }
             QPushButton[variant="primary"]:pressed {
-                background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                    stop:0 #b8691c, stop:1 #8d4d12);
-                border-color: #f0b05b;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #b86018, stop:1 #8c4510);
+                border-top-color: #c87828;
             }
+
+            /* Secondary */
             QPushButton[variant="secondary"] {
-                background: #121a25;
-                color: #cad7e6;
-                border-color: #344659;
+                background: #0f1a26;
+                color: #b8cfde;
+                border-top-color: #344c62;
+                border-left-color: #263848;
+                border-right-color: #1c2c3a;
+                border-bottom-color: #141e2a;
             }
+            QPushButton[variant="secondary"]:hover {
+                background: #182436;
+                color: #d0e0ee;
+            }
+
+            /* ── Inputs ── */
             QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QListWidget {
-                background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #0f1822, stop:1 #0b1118);
-                border: 1px solid #3a4d62;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #101b27, stop:1 #0b1320);
+                border-top: 1px solid #2c4258;
+                border-left: 1px solid #243448;
+                border-right: 1px solid #1c2a38;
+                border-bottom: 1px solid #141e2c;
                 border-radius: 11px;
                 padding: 6px 10px;
-                color: #edf3fb;
-                selection-background-color: #f09d3b;
+                color: #e0ecfa;
+                selection-background-color: #e88c28;
                 min-height: 18px;
             }
+            QComboBox QLineEdit {
+                background: transparent;
+                border: none;
+                color: #e0ecfa;
+                selection-background-color: #e88c28;
+            }
+            QLineEdit:focus, QComboBox:focus {
+                border-top-color: #4a7090;
+                border-left-color: #385570;
+            }
+
+            /* ── ComboBox ── */
             QComboBox::drop-down {
-                width: 28px;
-                border-left: 1px solid #334557;
-                background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #1e2a39, stop:1 #101721);
-                border-top-right-radius: 11px;
-                border-bottom-right-radius: 11px;
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 24px;
+                margin: 1px 1px 1px 0;
+                border: none;
+                border-left: 1px solid #213245;
+                background: transparent;
+                border-top-right-radius: 10px;
+                border-bottom-right-radius: 10px;
             }
             QComboBox::down-arrow {
                 image: none;
@@ -1695,168 +1934,115 @@ class VisionAudioWindow(QMainWindow):
                 height: 0;
                 border-left: 5px solid transparent;
                 border-right: 5px solid transparent;
-                border-top: 7px solid #f0b15a;
-                margin-right: 8px;
+                border-top: 7px solid #91b8d8;
+                margin-right: 7px;
             }
+            QComboBox::down-arrow:on {
+                border-top-color: #f2ba63;
+            }
+            QComboBox QAbstractItemView {
+                background: #0e1824;
+                border: 1px solid #2c4260;
+                border-radius: 10px;
+                selection-background-color: #1e3552;
+                color: #deeaf8;
+            }
+
+            /* ── List ── */
             QListWidget::item {
-                border-bottom: 1px solid #223142;
+                border-bottom: 1px solid #1e3044;
                 padding: 8px 6px;
             }
             QListWidget::item:selected {
-                background: #1d3146;
+                background: #1a3252;
                 border-radius: 8px;
+                color: #eaf3ff;
             }
+            QListWidget::item:hover {
+                background: #162840;
+            }
+
+            /* ── Log ── */
             QPlainTextEdit {
-                background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #0f1822, stop:1 #0b1118);
-                border: 1px solid #3a4d62;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #0d1820, stop:1 #091218);
+                border: 1px solid #263a52;
                 border-radius: 11px;
-                padding: 6px 10px;
-                color: #edf3fb;
-                selection-background-color: #f09d3b;
+                padding: 8px 10px;
+                color: #c8d8e8;
+                selection-background-color: #e88c28;
                 font-family: "DejaVu Sans Mono";
-                font-size: 11px;
+                font-size: 10.5px;
+                line-height: 1.4;
             }
-            QScrollArea, QScrollArea > QWidget > QWidget {
+
+            /* ── Scrollbars ── */
+            QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; border: none; }
+            QScrollBar:vertical {
+                width: 14px;
+                background: rgba(5, 10, 16, 0.28);
+                border-left: 1px solid rgba(70, 100, 128, 0.28);
+                margin: 6px 2px 6px 0;
+                border-radius: 7px;
+            }
+            QScrollBar::handle:vertical {
+                min-height: 34px;
+                border-radius: 7px;
+                border: 1px solid #36526c;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #3e5f7d, stop:0.48 #2a4258, stop:1 #1b2f42);
+            }
+            QScrollBar::handle:vertical:hover {
+                border-color: #4f7698;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #4b7194, stop:0.48 #355474, stop:1 #21384e);
+            }
+            QScrollBar::handle:vertical:pressed {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #27425b, stop:1 #18293a);
+            }
+            QScrollBar:horizontal {
+                height: 14px;
+                background: rgba(5, 10, 16, 0.28);
+                border-top: 1px solid rgba(70, 100, 128, 0.28);
+                margin: 0 6px 2px 6px;
+                border-radius: 7px;
+            }
+            QScrollBar::handle:horizontal {
+                min-width: 34px;
+                border-radius: 7px;
+                border: 1px solid #36526c;
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #3e5f7d, stop:0.48 #2a4258, stop:1 #1b2f42);
+            }
+            QScrollBar::handle:horizontal:hover {
+                border-color: #4f7698;
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #4b7194, stop:0.48 #355474, stop:1 #21384e);
+            }
+            QScrollBar::handle:horizontal:pressed {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #27425b, stop:1 #18293a);
+            }
+            QScrollBar::add-line, QScrollBar::sub-line,
+            QScrollBar::add-page, QScrollBar::sub-page {
                 background: transparent;
                 border: none;
             }
-            QScrollBar:vertical {
-                width: 13px;
-                background: #0b1118;
-                border-radius: 7px;
-                margin: 2px;
-            }
-            QScrollBar::handle:vertical {
-                background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #607a97, stop:1 #314458);
-                border-radius: 7px;
-                min-height: 28px;
-            }
-            QScrollBar:horizontal {
-                height: 13px;
-                background: #0b1118;
-                border-radius: 7px;
-                margin: 2px;
-            }
-            QScrollBar::handle:horizontal {
-                background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #607a97, stop:1 #314458);
-                border-radius: 7px;
-                min-width: 28px;
-            }
-            QSlider::groove:horizontal {
-                height: 12px;
-                background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #0c131c, stop:1 #182230);
-                border: 1px solid #41576f;
-                border-radius: 6px;
-            }
-            QSlider::sub-page:horizontal {
-                background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #f28b2c, stop:1 #ffd06d);
-                border-radius: 5px;
-            }
-            QSlider::handle:horizontal {
-                width: 24px;
-                margin: -7px 0;
-                background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                    stop:0 #fdfefe, stop:0.14 #ccd7e3, stop:0.5 #8797aa, stop:0.51 #5a697b, stop:1 #27313e);
-                border: 1px solid #d8e0e8;
-                border-radius: 11px;
-            }
-            QSlider::groove:vertical {
-                width: 18px;
-                background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #0b1118, stop:0.48 #16202b, stop:1 #253545);
-                border: 1px solid #3f5367;
-                border-radius: 9px;
-                margin: 4px 0;
-            }
-            QSlider::sub-page:vertical {
-                background: qlineargradient(x1:0,y1:1,x2:0,y2:0, stop:0 #eb7f29, stop:0.5 #ffc269, stop:1 #fff0a2);
-                border-radius: 8px;
-            }
-            QSlider::add-page:vertical {
-                background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #15202b, stop:1 #0a1016);
-                border-radius: 8px;
-            }
-            QSlider::handle:vertical {
-                height: 26px;
-                margin: 0 -7px;
-                background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                    stop:0 #fafcfe, stop:0.16 #d2dbe5, stop:0.5 #92a0b1, stop:0.51 #647283, stop:1 #25313d);
-                border: 1px solid #eef2f6;
-                border-radius: 9px;
-            }
+
+            /* ── Progress bar ── */
             QProgressBar {
-                background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #0d141d, stop:1 #0a1016);
-                border: 1px solid #3b4e62;
-                border-radius: 10px;
-                color: #eff4fb;
+                background: #0d1620;
+                border: 1px solid #24384c;
+                border-radius: 6px;
+                color: #e8f0fa;
                 text-align: center;
+                font-size: 10px;
+                font-weight: 700;
             }
             QProgressBar::chunk {
-                background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #ef7d27, stop:0.6 #f8ba4f, stop:1 #fff0a0);
-                border-radius: 8px;
-            }
-            QToolButton {
-                color: #eaf1f9;
-                border: 1px solid #3e5266;
-                border-radius: 10px;
-                padding: 5px 9px;
-                background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #213042, stop:1 #141e29);
-                font-weight: 700;
-            }
-            QLabel#StatusBadge {
-                border-radius: 12px;
-                padding: 8px 12px;
-                font-size: 12px;
-                font-weight: 700;
-                color: #f8fbff;
-            }
-            QLabel#StatusBadge[state="ready"] {
-                background: #13212f;
-                border: 1px solid #47617a;
-            }
-            QLabel#StatusBadge[state="busy"] {
-                background: #3a2a16;
-                border: 1px solid #d19035;
-                color: #ffe7b0;
-            }
-            QLabel#StatusBadge[state="error"] {
-                background: #361820;
-                border: 1px solid #d16173;
-                color: #ffd9df;
-            }
-            QSplitter::handle {
-                background: transparent;
-            }
-            QSplitter::handle:horizontal {
-                width: 10px;
-                margin: 8px 0;
-            }
-            QSplitter::handle:vertical {
-                height: 10px;
-                margin: 0 8px;
-            }
-            QSplitter::handle:hover {
-                background: rgba(143, 167, 195, 0.18);
+                background: #e89a36;
                 border-radius: 5px;
-            }
-            QGroupBox {
-                border: 1px solid #314355;
-                border-radius: 16px;
-                margin-top: 14px;
-                padding-top: 16px;
-                background: rgba(8, 13, 19, 0.45);
-                font-weight: 700;
-                color: #eef4fb;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 12px;
-                padding: 0 6px;
-                color: #f2c36d;
-            }
-            QFrame#ProfileSlot {
-                background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #1b212a, stop:1 #10141a);
-                border: 1px solid #314255;
-                border-radius: 12px;
             }
             """
         )
@@ -2190,45 +2376,57 @@ class VisionAudioWindow(QMainWindow):
     def _build_player_bar(self) -> QFrame:
         card = QFrame()
         card.setObjectName("PlayerBar")
-        card.setMinimumHeight(122)
+        card.setMinimumHeight(130)
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(10)
+        layout.setContentsMargins(18, 12, 18, 12)
+        layout.setSpacing(9)
 
+        # ── Title row ──────────────────────────────────────
         top = QHBoxLayout()
-        self.player_title_label = QLabel("Player pronto para sequencia gerada")
-        self.player_title_label.setStyleSheet("font-size:12px;font-weight:700;color:#eef4fb;")
-        self.player_state_label = QLabel("Idle")
-        self.player_state_label.setObjectName("SectionMeta")
+        top.setSpacing(10)
+        self.player_title_label = QLabel("Player pronto para sequência gerada")
+        self.player_title_label.setObjectName("PlayerTitle")
+        self.player_state_label = QLabel("● Idle")
+        self.player_state_label.setObjectName("PlayerState")
         top.addWidget(self.player_title_label, 1)
         top.addWidget(self.player_state_label)
         layout.addLayout(top)
 
+        # ── Controls row ────────────────────────────────────
         controls = QHBoxLayout()
         controls.setSpacing(8)
-        self.play_button = QPushButton("Play")
-        self.play_button.setProperty("variant", "primary")
-        self.play_button.clicked.connect(self.toggle_playback)
-        self.stop_button = QPushButton("Stop")
-        self.stop_button.setProperty("variant", "secondary")
-        self.stop_button.clicked.connect(self.stop_playback)
-        self.seek_back_button = QPushButton("-10s")
-        self.seek_back_button.setProperty("variant", "secondary")
+
+        self.seek_back_button = QPushButton("⏮  −10s")
+        self.seek_back_button.setObjectName("SeekBtn")
         self.seek_back_button.clicked.connect(lambda: self.playback_controller.seek_relative(-SEEK_STEP_S))
-        self.seek_forward_button = QPushButton("+10s")
-        self.seek_forward_button.setProperty("variant", "secondary")
+
+        self.play_button = QPushButton("▶   Play")
+        self.play_button.setObjectName("PlayBtn")
+        self.play_button.clicked.connect(self.toggle_playback)
+
+        self.stop_button = QPushButton("■   Stop")
+        self.stop_button.setObjectName("StopBtn")
+        self.stop_button.clicked.connect(self.stop_playback)
+
+        self.seek_forward_button = QPushButton("+10s   ⏭")
+        self.seek_forward_button.setObjectName("SeekBtn")
         self.seek_forward_button.clicked.connect(lambda: self.playback_controller.seek_relative(SEEK_STEP_S))
-        self.position_label = QLabel("00:00 / --:--")
-        self.position_label.setObjectName("SectionMeta")
+
+        self.position_label = QLabel("0:00 / --:--")
+        self.position_label.setObjectName("PositionLabel")
+
+        controls.addStretch(1)
+        controls.addWidget(self.seek_back_button)
         controls.addWidget(self.play_button)
         controls.addWidget(self.stop_button)
-        controls.addWidget(self.seek_back_button)
         controls.addWidget(self.seek_forward_button)
-        controls.addWidget(self.position_label)
         controls.addStretch(1)
+        controls.addWidget(self.position_label)
         layout.addLayout(controls)
 
+        # ── Scrubber ────────────────────────────────────────
         self.scrubber = QSlider(Qt.Horizontal)
+        self.scrubber.setObjectName("Scrubber")
         self.scrubber.setRange(0, 1000)
         self.scrubber.sliderPressed.connect(self._begin_scrub)
         self.scrubber.sliderReleased.connect(self._end_scrub)
@@ -2238,10 +2436,24 @@ class VisionAudioWindow(QMainWindow):
     def _apply_depth_effects(self) -> None:
         for widget in self.findChildren(QFrame):
             if widget.objectName() in {"Card", "PlayerBar"}:
-                apply_drop_shadow(widget, blur_radius=24, y_offset=8, alpha=70)
+                apply_drop_shadow(widget, blur_radius=36, y_offset=12, alpha=110)
         for button in self.findChildren(QPushButton):
-            apply_drop_shadow(button, blur_radius=10, y_offset=2, alpha=55)
-        apply_drop_shadow(self.status_badge, blur_radius=16, y_offset=3, alpha=55)
+            apply_drop_shadow(button, blur_radius=14, y_offset=3, alpha=70)
+        apply_drop_shadow(self.status_badge, blur_radius=22, y_offset=4, alpha=80)
+
+    # ── Startup fade-in ────────────────────────────────────
+    def _start_fade_in(self) -> None:
+        self._fade_value = 0.0
+        self._fade_timer = QTimer(self)
+        self._fade_timer.setInterval(14)
+        self._fade_timer.timeout.connect(self._fade_step)
+        self._fade_timer.start()
+
+    def _fade_step(self) -> None:
+        self._fade_value = min(1.0, self._fade_value + 0.04)
+        self.setWindowOpacity(self._fade_value)
+        if self._fade_value >= 1.0:
+            self._fade_timer.stop()
 
     def _bind_playback(self) -> None:
         self.playback_controller.state_changed.connect(self._on_playback_state_changed)
@@ -2505,9 +2717,14 @@ class VisionAudioWindow(QMainWindow):
         self.playback_controller.stop()
 
     def _on_playback_state_changed(self, state: str) -> None:
-        labels = {"idle": "Idle", "playing": "Tocando", "paused": "Pausado", "error": "Erro"}
+        labels = {
+            "idle":    "● Idle",
+            "playing": "▶ Tocando",
+            "paused":  "⏸ Pausado",
+            "error":   "⚠ Erro",
+        }
         self.player_state_label.setText(labels.get(state, state))
-        self.play_button.setText("Pause" if state == "playing" else "Play")
+        self.play_button.setText("⏸   Pause" if state == "playing" else "▶   Play")
         self._update_controls_enabled()
 
     def _on_playback_position_changed(self, elapsed: float, duration: float) -> None:
