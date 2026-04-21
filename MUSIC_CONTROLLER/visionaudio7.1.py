@@ -1780,7 +1780,7 @@ class VisionAudioWindow(QMainWindow):
                 font-size: 10px;
             }
             QLabel#PlayerTitle {
-                font-size: 13px;
+                font-size: 15px;
                 font-weight: 700;
                 color: #edf5fd;
                 letter-spacing: 0.3px;
@@ -2129,7 +2129,7 @@ class VisionAudioWindow(QMainWindow):
         self.connect_button.clicked.connect(self.toggle_connection)
         self.connection_label = QLabel("Arduino desconectado")
         self.connection_label.setObjectName("SectionMeta")
-        self.progress_label = QLabel("Aguardando acao")
+        self.progress_label = QLabel("Aguardando ação")
         self.progress_label.setObjectName("SectionMeta")
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
@@ -2190,7 +2190,7 @@ class VisionAudioWindow(QMainWindow):
         layout.addWidget(self.track_title_label)
         layout.addWidget(self.track_meta_label)
 
-        self.feature_summary_label = QLabel("Sem analise ainda.")
+        self.feature_summary_label = QLabel("Sem análise ainda.")
         self.feature_summary_label.setWordWrap(True)
         self.feature_summary_label.setStyleSheet(
             "color:#bfd1e4;background:#0d1621;border:1px solid #22364a;border-radius:12px;padding:10px;font-size:10px;"
@@ -2222,7 +2222,7 @@ class VisionAudioWindow(QMainWindow):
         layout = QVBoxLayout(card)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(6)
-        title = QLabel("Transicoes")
+        title = QLabel("Transições")
         title.setObjectName("SectionTitle")
         self.transition_list = QListWidget()
         self.transition_list.setMinimumHeight(126)
@@ -2298,7 +2298,7 @@ class VisionAudioWindow(QMainWindow):
         row = QHBoxLayout()
         row.setSpacing(8)
         for label_text, combo in (
-            ("Transicoes", self.transition_profile_combo),
+            ("Transições", self.transition_profile_combo),
             ("Agressividade", self.effect_profile_combo),
             ("Velocidade meio", self.middle_speed_combo),
         ):
@@ -2337,7 +2337,7 @@ class VisionAudioWindow(QMainWindow):
         return card
 
     def _build_advanced_controls_card(self) -> QFrame:
-        section = CollapsibleSection("Painel avancado")
+        section = CollapsibleSection("Painel avançado")
         for group in ADVANCED_GROUPS:
             group_box = QGroupBox(group)
             group_layout = QVBoxLayout(group_box)
@@ -2366,7 +2366,7 @@ class VisionAudioWindow(QMainWindow):
                 self._group_fields[group].append(key)
                 form.addRow(spec.label, editor)
             group_layout.addLayout(form)
-            restore_button = QPushButton(f"Restaurar padroes de {group}")
+            restore_button = QPushButton(f"Restaurar padrões de {group}")
             restore_button.setProperty("variant", "secondary")
             restore_button.clicked.connect(lambda _checked=False, group_name=group: self.restore_group_defaults(group_name))
             group_layout.addWidget(restore_button)
@@ -2386,7 +2386,7 @@ class VisionAudioWindow(QMainWindow):
         top.setSpacing(10)
         self.player_title_label = QLabel("Player pronto para sequência gerada")
         self.player_title_label.setObjectName("PlayerTitle")
-        self.player_state_label = QLabel("● Idle")
+        self.player_state_label = QLabel("Idle")
         self.player_state_label.setObjectName("PlayerState")
         top.addWidget(self.player_title_label, 1)
         top.addWidget(self.player_state_label)
@@ -2610,7 +2610,7 @@ class VisionAudioWindow(QMainWindow):
         self._recommend_worker.finished_result.connect(self.handle_recommendation)
         self._recommend_worker.failed.connect(self._handle_worker_error)
         self._recommend_worker.finished.connect(self._finish_background_task)
-        self._set_busy(True, "Analisando faixa para recomendacao...", 0)
+        self._set_busy(True, "Analisando faixa para recomendação...", 0)
         self._recommend_worker.start()
 
     def generate_sequence(self) -> None:
@@ -2625,7 +2625,7 @@ class VisionAudioWindow(QMainWindow):
         self._generation_worker.finished_result.connect(self.handle_generated_sequence)
         self._generation_worker.failed.connect(self._handle_worker_error)
         self._generation_worker.finished.connect(self._finish_background_task)
-        self._set_busy(True, "Gerando sequencia...", 0)
+        self._set_busy(True, "Gerando sequência...", 0)
         self._generation_worker.start()
 
     def current_ui_state(self) -> UIConfigState:
@@ -2651,7 +2651,7 @@ class VisionAudioWindow(QMainWindow):
             meta.append(format_bytes(track.file_size_bytes))
         self.track_meta_label.setText(" | ".join(meta))
         self.player_title_label.setText(f"{track.title} carregada")
-        self.feature_summary_label.setText("Faixa carregada. Clique em 'Sugerir parametros' ou 'Gerar sequencia'.")
+        self.feature_summary_label.setText("Faixa carregada. Clique em 'Sugerir parâmetros' ou 'Gerar sequência'.")
         self.transition_list.clear()
         self.timeline_widget.set_sequence(None)
         self.led_preview.set_levels([0] * 6)
@@ -2678,7 +2678,7 @@ class VisionAudioWindow(QMainWindow):
         self.middle_speed_combo.setCurrentIndex(max(0, self.middle_speed_combo.findData(middle_speed)))
         engine_label = "scikit-learn" if result.using_sklearn else "fallback interno"
         self.feature_summary_label.setText("\n".join(result.summary_lines + [f"Modelo: {engine_label}"]))
-        self.log(f"Parametros sugeridos com {engine_label}.")
+        self.log(f"Parâmetros sugeridos com {engine_label}.")
 
     def handle_generated_sequence(self, sequence: GeneratedSequence) -> None:
         self.current_sequence = sequence
@@ -2696,7 +2696,7 @@ class VisionAudioWindow(QMainWindow):
                 [
                     f"BPM detectado: {sequence.tempo_bpm:.1f}",
                     f"Frames: {len(sequence.led_patterns)}",
-                    f"Transicoes: {len(sequence.transitions)}",
+                    f"Transições: {len(sequence.transitions)}",
                     f"Densidade: {sequence.feature_snapshot.get('beat_density', 0.0):.2f}",
                 ]
             )
@@ -2780,7 +2780,7 @@ class VisionAudioWindow(QMainWindow):
             control.setValue(spec.default)
             control.blockSignals(False)
             control.setStyleSheet("")
-        self.log(f"Padroes restaurados em {group_name}.")
+        self.log(f"Padrões restaurados em {group_name}.")
 
     def log(self, message: str, level: str = "info") -> None:
         prefix = {"info": "[INFO]", "warn": "[WARN]", "error": "[ERRO]"}.get(level, "[INFO]")
@@ -2815,7 +2815,7 @@ def collect_dependency_summary() -> str:
 def main() -> int:
     app = QApplication.instance() or QApplication(sys.argv)
     window = VisionAudioWindow()
-    window.log("Dependencias: " + collect_dependency_summary())
+    window.log("Dependências: " + collect_dependency_summary())
     window.show()
     return app.exec()
 
