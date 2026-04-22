@@ -5,8 +5,10 @@ import glob
 import importlib
 import importlib.util
 import io
+import json
 import math
 import os
+import random
 import shutil
 import signal
 import subprocess
@@ -14,12 +16,14 @@ import sys
 import tempfile
 import time
 import traceback
+import warnings
+import webbrowser
 import wave
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from PyQt5.QtCore import QPointF, QRectF, Qt, QThread, QTimer, pyqtSignal
+from PyQt5.QtCore import QPointF, QRectF, Qt, QProcess, QProcessEnvironment, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import (
     QColor,
     QFont,
@@ -377,6 +381,48 @@ class UIConfigState:
         overrides.update(self.normalized_values())
         return replace(cfg, **overrides)
 
+    def to_serializable(self) -> Dict[str, Any]:
+        return {
+            "transition_profile": self.transition_profile,
+            "effect_profile": self.effect_profile,
+            "middle_speed_multiplier": float(self.middle_speed_multiplier),
+            "values": self.normalized_values(),
+        }
+
+    @classmethod
+    def from_serializable(cls, payload: Dict[str, Any]) -> "UIConfigState":
+        if not isinstance(payload, dict):
+            raise ValueError("Formato de configuração inválido.")
+        transition_profile = str(payload.get("transition_profile", "medium"))
+        if transition_profile not in TRANSITION_PROFILE_LABELS:
+            transition_profile = "medium"
+        effect_profile = str(payload.get("effect_profile", "medium"))
+        if effect_profile not in EFFECT_PROFILE_LABELS:
+            effect_profile = "medium"
+        middle_speed_raw = payload.get("middle_speed_multiplier", 1.0)
+        try:
+            middle_speed = float(middle_speed_raw)
+        except (TypeError, ValueError):
+            middle_speed = 1.0
+        if middle_speed not in MIDDLE_SPEED_OPTIONS:
+            middle_speed = 1.0
+        values = default_control_values()
+        raw_values = payload.get("values", {})
+        if isinstance(raw_values, dict):
+            for key, spec in CONTROL_SPECS.items():
+                if key not in raw_values:
+                    continue
+                try:
+                    values[key] = spec.clamp(float(raw_values[key]))
+                except (TypeError, ValueError):
+                    values[key] = spec.default
+        return cls(
+            transition_profile=transition_profile,
+            effect_profile=effect_profile,
+            middle_speed_multiplier=middle_speed,
+            values=values,
+        )
+
 
 @dataclass
 class LoadedTrack:
@@ -388,6 +434,7 @@ class LoadedTrack:
     duration_s: Optional[float] = None
     file_size_bytes: Optional[int] = None
     youtube_video_url: Optional[str] = None
+    youtube_page_url: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -397,6 +444,7 @@ class RecommendationResult:
     categorical_values: Dict[str, Any]
     feature_snapshot: Dict[str, float]
     using_sklearn: bool
+    model_label: str = "fallback interno"
     summary_lines: List[str] = field(default_factory=list)
 
 
@@ -415,6 +463,14 @@ class GeneratedSequence:
     feature_snapshot: Dict[str, float]
     preview_columns: List[List[int]]
     temp_files: List[str] = field(default_factory=list)
+
+
+@dataclass
+class CachedTrackData:
+    y: Any
+    sr: int
+    duration_s: float
+    feature_snapshot: Optional[Dict[str, float]] = None
 
 
 def build_preview_columns(led_patterns: Sequence[Tuple[int, Any]], columns: int = PRIMARY_TIMELINE_COLUMNS) -> List[List[int]]:
@@ -461,7 +517,7 @@ class AudioSourceResolver:
                 metadata={"suffix": Path(path).suffix.lower()},
             )
 
-        stream_url, title, video_url = self.resolve_youtube_stream(value)
+        stream_url, title, video_url, page_url = self.resolve_youtube_stream(value)
         return LoadedTrack(
             source_mode="youtube",
             requested_source=value,
@@ -469,11 +525,12 @@ class AudioSourceResolver:
             title=title,
             display_source=value,
             youtube_video_url=video_url,
+            youtube_page_url=page_url,
             metadata={"platform": "youtube"},
         )
 
     @staticmethod
-    def resolve_youtube_stream(query_or_url: str) -> Tuple[str, str, Optional[str]]:
+    def resolve_youtube_stream(query_or_url: str) -> Tuple[str, str, Optional[str], Optional[str]]:
         if not dependency_available("yt_dlp"):
             raise DependencyError("yt-dlp nao encontrado. Instale com: pip install yt-dlp")
         yt_dlp = importlib.import_module("yt_dlp")
@@ -514,11 +571,26 @@ class AudioSourceResolver:
             and item.get("acodec") not in (None, "none")
             and item.get("vcodec") not in (None, "none")
         ]
+        video_formats = [
+            item
+            for item in formats
+            if item.get("url")
+            and item.get("vcodec") not in (None, "none")
+        ]
         video_url = None
-        if av_formats:
-            av_formats.sort(key=lambda item: (item.get("height") or 0.0, item.get("tbr") or 0.0))
-            video_url = av_formats[-1]["url"]
-        return stream_url, info.get("title") or "YouTube", video_url
+        preferred_video_formats = av_formats or video_formats
+        if preferred_video_formats:
+            preferred_video_formats.sort(
+                key=lambda item: (
+                    item.get("height") or 0.0,
+                    item.get("fps") or 0.0,
+                    1 if item.get("acodec") not in (None, "none") else 0,
+                    item.get("tbr") or 0.0,
+                )
+            )
+            video_url = preferred_video_formats[-1]["url"]
+        page_url = info.get("webpage_url") or info.get("original_url") or query_or_url
+        return stream_url, info.get("title") or "YouTube", video_url, page_url
 
 
 class AudioReader6EngineLoader:
@@ -591,8 +663,10 @@ class ParameterRecommendationService:
     def __init__(self) -> None:
         self._archetypes = self._build_archetypes()
         self._using_sklearn = False
+        self._model_label = "fallback interno"
         self._numeric_model = None
         self._numeric_scaler = None
+        self._numeric_target_scaler = None
         self._categorical_models: Dict[str, Any] = {}
         self._categorical_scalers: Dict[str, Any] = {}
         self._feature_matrix: List[List[float]] = []
@@ -654,38 +728,158 @@ class ParameterRecommendationService:
             },
         ]
 
+    def _feature_ranges(self) -> List[float]:
+        columns = list(zip(*self._feature_matrix))
+        return [max(max(col) - min(col), 1e-6) for col in columns]
+
+    def _build_augmented_samples(self) -> List[Tuple[List[float], List[float], Dict[str, Any]]]:
+        if not self._feature_matrix:
+            return []
+        rng = random.Random(7)
+        feature_ranges = self._feature_ranges()
+        samples: List[Tuple[List[float], List[float], Dict[str, Any]]] = []
+
+        for archetype in self._archetypes:
+            base_features = [float(value) for value in archetype["features"]]
+            base_numeric = [float(value) for value in archetype["numeric"]]
+            base_categorical = dict(archetype["categorical"])
+            samples.append((base_features, base_numeric, base_categorical))
+
+            for _ in range(18):
+                noisy_features: List[float] = []
+                for idx, (value, spread) in enumerate(zip(base_features, feature_ranges)):
+                    jitter_ratio = 0.045 if idx in (0, 9) else 0.032
+                    noisy_features.append(float(value + rng.gauss(0.0, spread * jitter_ratio)))
+                noisy_numeric: List[float] = []
+                for idx, key in enumerate(self.NUMERIC_TARGET_KEYS):
+                    spec = CONTROL_SPECS[key]
+                    span = max(spec.maximum - spec.minimum, 1e-6)
+                    nudged = base_numeric[idx] + rng.gauss(0.0, span * 0.022)
+                    noisy_numeric.append(float(spec.clamp(nudged)))
+                samples.append((noisy_features, noisy_numeric, dict(base_categorical)))
+
+        total = len(self._archetypes)
+        for left_idx in range(total):
+            left = self._archetypes[left_idx]
+            for right_idx in range(left_idx + 1, total):
+                right = self._archetypes[right_idx]
+                if abs(float(left["features"][0]) - float(right["features"][0])) > 54.0:
+                    continue
+                for blend in (0.25, 0.5, 0.75):
+                    blended_features: List[float] = []
+                    blended_numeric: List[float] = []
+                    for idx, (left_value, right_value) in enumerate(zip(left["features"], right["features"])):
+                        mixed = float(left_value) * (1.0 - blend) + float(right_value) * blend
+                        mixed += rng.gauss(0.0, feature_ranges[idx] * 0.012)
+                        blended_features.append(mixed)
+                    for idx, key in enumerate(self.NUMERIC_TARGET_KEYS):
+                        spec = CONTROL_SPECS[key]
+                        mixed = float(left["numeric"][idx]) * (1.0 - blend) + float(right["numeric"][idx]) * blend
+                        blended_numeric.append(float(spec.clamp(mixed)))
+                    blended_categorical: Dict[str, Any] = {}
+                    for key in self.CATEGORICAL_TARGET_KEYS:
+                        left_value = left["categorical"][key]
+                        right_value = right["categorical"][key]
+                        if left_value == right_value:
+                            blended_categorical[key] = left_value
+                        elif key == "middle_speed_multiplier":
+                            blended_categorical[key] = left_value if blend < 0.5 else right_value
+                        else:
+                            blended_categorical[key] = left_value if blend <= 0.5 else right_value
+                    samples.append((blended_features, blended_numeric, blended_categorical))
+        return samples
+
     def _train(self) -> None:
         self._feature_matrix = [row["features"] for row in self._archetypes]
         if not dependency_available("sklearn"):
             return
         try:
+            from sklearn.exceptions import ConvergenceWarning
             from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
+            from sklearn.neural_network import MLPClassifier, MLPRegressor
             from sklearn.preprocessing import StandardScaler
         except Exception:
             return
 
+        samples = self._build_augmented_samples()
+        if not samples:
+            return
+        train_x = [row[0] for row in samples]
+        train_numeric_y = [row[1] for row in samples]
         self._numeric_scaler = StandardScaler()
-        scaled_x = self._numeric_scaler.fit_transform(self._feature_matrix)
-        numeric_y = [row["numeric"] for row in self._archetypes]
-        self._numeric_model = KNeighborsRegressor(n_neighbors=3, weights="distance")
-        self._numeric_model.fit(scaled_x, numeric_y)
+        scaled_x = self._numeric_scaler.fit_transform(train_x)
+        numeric_target_scaler = StandardScaler()
+        scaled_numeric_y = numeric_target_scaler.fit_transform(train_numeric_y)
 
+        numeric_neural_ok = False
+        with warnings.catch_warnings(record=True) as numeric_warnings:
+            warnings.simplefilter("always", ConvergenceWarning)
+            numeric_model = MLPRegressor(
+                hidden_layer_sizes=(16, 8),
+                activation="tanh",
+                solver="lbfgs",
+                alpha=2e-3,
+                max_iter=12000,
+                random_state=7,
+            )
+            numeric_model.fit(scaled_x, scaled_numeric_y)
+        numeric_has_warning = any(issubclass(item.category, ConvergenceWarning) for item in numeric_warnings)
+        try:
+            numeric_predictions = numeric_target_scaler.inverse_transform(numeric_model.predict(scaled_x))
+        except Exception:
+            numeric_predictions = []
+        numeric_error = self._normalized_numeric_mae(numeric_predictions, train_numeric_y)
+        if (not numeric_has_warning) and math.isfinite(numeric_error) and numeric_error <= 0.10:
+            self._numeric_model = numeric_model
+            self._numeric_target_scaler = numeric_target_scaler
+            numeric_neural_ok = True
+        else:
+            self._numeric_model = KNeighborsRegressor(n_neighbors=5, weights="distance")
+            self._numeric_model.fit(scaled_x, train_numeric_y)
+            self._numeric_target_scaler = None
+
+        categorical_neural_count = 0
         for key in self.CATEGORICAL_TARGET_KEYS:
             scaler = StandardScaler()
-            sx = scaler.fit_transform(self._feature_matrix)
-            y = [row["categorical"][key] for row in self._archetypes]
-            model = KNeighborsClassifier(n_neighbors=3, weights="distance")
-            model.fit(sx, y)
+            sx = scaler.fit_transform(train_x)
+            y = [row[2][key] for row in samples]
+            with warnings.catch_warnings(record=True) as class_warnings:
+                warnings.simplefilter("always", ConvergenceWarning)
+                model = MLPClassifier(
+                    hidden_layer_sizes=(12,),
+                    activation="tanh",
+                    solver="lbfgs",
+                    alpha=2e-3,
+                    max_iter=12000,
+                    random_state=11 + len(self._categorical_models),
+                )
+                model.fit(sx, y)
+            class_has_warning = any(issubclass(item.category, ConvergenceWarning) for item in class_warnings)
+            try:
+                predicted_labels = list(model.predict(sx))
+            except Exception:
+                predicted_labels = []
+            accuracy = self._categorical_accuracy(predicted_labels, y)
+            if class_has_warning or accuracy < 0.84:
+                model = KNeighborsClassifier(n_neighbors=5, weights="distance")
+                model.fit(sx, y)
+            else:
+                categorical_neural_count += 1
             self._categorical_scalers[key] = scaler
             self._categorical_models[key] = model
 
         self._using_sklearn = True
+        if numeric_neural_ok and categorical_neural_count == len(self.CATEGORICAL_TARGET_KEYS):
+            self._model_label = "rede neural scikit-learn"
+        elif numeric_neural_ok or categorical_neural_count:
+            self._model_label = "hibrido scikit-learn"
+        else:
+            self._model_label = "fallback scikit-learn"
 
     def _distance_weights(self, feature_values: List[float]) -> List[Tuple[float, Dict[str, Any]]]:
         if not self._archetypes:
             return []
-        columns = list(zip(*self._feature_matrix))
-        ranges = [max(max(col) - min(col), 1e-6) for col in columns]
+        ranges = self._feature_ranges()
         pairs = []
         for row, archetype in zip(self._feature_matrix, self._archetypes):
             squared = 0.0
@@ -696,39 +890,75 @@ class ParameterRecommendationService:
         pairs.sort(key=lambda item: item[0])
         return pairs[:3]
 
+    def _fallback_prediction(self, feature_values: List[float]) -> Tuple[Dict[str, float], Dict[str, Any]]:
+        neighbors = self._distance_weights(feature_values)
+        total_weight = 0.0
+        accumulator = [0.0] * len(self.NUMERIC_TARGET_KEYS)
+        categorical_votes: Dict[str, Dict[Any, float]] = {key: {} for key in self.CATEGORICAL_TARGET_KEYS}
+        for distance, archetype in neighbors:
+            weight = 1.0 / max(distance, 1e-6)
+            total_weight += weight
+            for idx, value in enumerate(archetype["numeric"]):
+                accumulator[idx] += weight * float(value)
+            for key, value in archetype["categorical"].items():
+                categorical_votes[key][value] = categorical_votes[key].get(value, 0.0) + weight
+        numeric_values = {}
+        for idx, key in enumerate(self.NUMERIC_TARGET_KEYS):
+            value = accumulator[idx] / max(total_weight, 1e-9)
+            numeric_values[key] = CONTROL_SPECS[key].clamp(value)
+        categorical_values = {}
+        for key, votes in categorical_votes.items():
+            categorical_values[key] = max(votes.items(), key=lambda item: item[1])[0]
+        return numeric_values, categorical_values
+
+    def _normalized_numeric_mae(self, predicted_rows: Sequence[Sequence[float]], expected_rows: Sequence[Sequence[float]]) -> float:
+        if len(predicted_rows) == 0 or len(expected_rows) == 0:
+            return float("inf")
+        total_error = 0.0
+        total_count = 0
+        for predicted, expected in zip(predicted_rows, expected_rows):
+            for key, predicted_value, expected_value in zip(self.NUMERIC_TARGET_KEYS, predicted, expected):
+                spec = CONTROL_SPECS[key]
+                span = max(spec.maximum - spec.minimum, 1e-6)
+                total_error += abs(float(predicted_value) - float(expected_value)) / span
+                total_count += 1
+        return total_error / max(total_count, 1)
+
+    def _categorical_accuracy(self, predicted: Sequence[Any], expected: Sequence[Any]) -> float:
+        if len(predicted) == 0 or len(expected) == 0:
+            return 0.0
+        correct = sum(1 for predicted_value, expected_value in zip(predicted, expected) if predicted_value == expected_value)
+        return correct / max(len(expected), 1)
+
     def recommend(self, feature_snapshot: Dict[str, float]) -> RecommendationResult:
         feature_values = [float(feature_snapshot.get(key, 0.0)) for key in self.FEATURE_KEYS]
+        fallback_numeric, fallback_categorical = self._fallback_prediction(feature_values)
         if self._using_sklearn and self._numeric_scaler and self._numeric_model:
             scaled_x = self._numeric_scaler.transform([feature_values])
-            predicted_numeric = list(self._numeric_model.predict(scaled_x)[0])
+            raw_numeric = self._numeric_model.predict(scaled_x)
+            if self._numeric_target_scaler is not None:
+                predicted_numeric = self._numeric_target_scaler.inverse_transform(raw_numeric)[0]
+            else:
+                predicted_numeric = raw_numeric[0]
             numeric_values = {
-                key: CONTROL_SPECS[key].clamp(float(value))
+                key: CONTROL_SPECS[key].clamp(float(value) * 0.72 + float(fallback_numeric[key]) * 0.28)
                 for key, value in zip(self.NUMERIC_TARGET_KEYS, predicted_numeric)
             }
             categorical_values: Dict[str, Any] = {}
             for key in self.CATEGORICAL_TARGET_KEYS:
                 scaler = self._categorical_scalers[key]
                 model = self._categorical_models[key]
-                categorical_values[key] = model.predict(scaler.transform([feature_values]))[0]
+                scaled_features = scaler.transform([feature_values])
+                predicted = model.predict(scaled_features)[0]
+                if hasattr(model, "predict_proba"):
+                    probabilities = model.predict_proba(scaled_features)[0]
+                    confidence = max(float(value) for value in probabilities)
+                    categorical_values[key] = predicted if confidence >= 0.56 else fallback_categorical[key]
+                else:
+                    categorical_values[key] = predicted
         else:
-            neighbors = self._distance_weights(feature_values)
-            total_weight = 0.0
-            accumulator = [0.0] * len(self.NUMERIC_TARGET_KEYS)
-            categorical_votes: Dict[str, Dict[Any, float]] = {key: {} for key in self.CATEGORICAL_TARGET_KEYS}
-            for distance, archetype in neighbors:
-                weight = 1.0 / max(distance, 1e-6)
-                total_weight += weight
-                for idx, value in enumerate(archetype["numeric"]):
-                    accumulator[idx] += weight * float(value)
-                for key, value in archetype["categorical"].items():
-                    categorical_votes[key][value] = categorical_votes[key].get(value, 0.0) + weight
-            numeric_values = {}
-            for idx, key in enumerate(self.NUMERIC_TARGET_KEYS):
-                value = accumulator[idx] / max(total_weight, 1e-9)
-                numeric_values[key] = CONTROL_SPECS[key].clamp(value)
-            categorical_values = {}
-            for key, votes in categorical_votes.items():
-                categorical_values[key] = max(votes.items(), key=lambda item: item[1])[0]
+            numeric_values = fallback_numeric
+            categorical_values = fallback_categorical
 
         summary_lines = [
             f"BPM {feature_snapshot.get('tempo_bpm', 0.0):.1f} | densidade {feature_snapshot.get('beat_density', 0.0):.2f}",
@@ -740,6 +970,7 @@ class ParameterRecommendationService:
             categorical_values=categorical_values,
             feature_snapshot=feature_snapshot,
             using_sklearn=self._using_sklearn,
+            model_label=self._model_label,
             summary_lines=summary_lines,
         )
 
@@ -747,6 +978,44 @@ class ParameterRecommendationService:
 class GenerationService:
     def __init__(self, engine_loader: Optional[AudioReader6EngineLoader] = None) -> None:
         self.engine_loader = engine_loader or AudioReader6EngineLoader()
+        self._track_cache: Dict[str, CachedTrackData] = {}
+
+    def _track_cache_key(self, track: LoadedTrack) -> str:
+        parts = [track.source_mode, track.resolved_source]
+        if track.source_mode == "local" and os.path.isfile(track.resolved_source):
+            stat = os.stat(track.resolved_source)
+            parts.extend([str(stat.st_size), str(stat.st_mtime_ns)])
+        else:
+            parts.append(track.requested_source)
+        return "|".join(parts)
+
+    def _cache_track_data(self, key: str, data: CachedTrackData) -> CachedTrackData:
+        self._track_cache[key] = data
+        while len(self._track_cache) > 3:
+            oldest_key = next((item_key for item_key in self._track_cache if item_key != key), None)
+            if oldest_key is None:
+                break
+            self._track_cache.pop(oldest_key, None)
+        return data
+
+    def _get_or_load_track_data(
+        self,
+        track: LoadedTrack,
+        librosa_module: Any,
+        progress_cb: Optional[Callable[[int, str], None]] = None,
+    ) -> CachedTrackData:
+        cache_key = self._track_cache_key(track)
+        cached = self._track_cache.get(cache_key)
+        if cached is not None:
+            if progress_cb:
+                progress_cb(10, "Usando audio em cache...")
+            return cached
+        if progress_cb:
+            progress_cb(10, "Carregando audio...")
+        y, sr = self._load_audio(track.resolved_source, target_sr=22050, librosa_module=librosa_module)
+        duration = max(librosa_module.get_duration(y=y, sr=sr), 1e-6)
+        cached = CachedTrackData(y=y, sr=sr, duration_s=float(duration))
+        return self._cache_track_data(cache_key, cached)
 
     def _peak_pick_onsets(self, librosa_module: Any, onset_env: Any) -> Any:
         peak_pick = librosa_module.util.peak_pick
@@ -786,10 +1055,12 @@ class GenerationService:
         progress_cb: Optional[Callable[[int, str], None]] = None,
     ) -> Dict[str, float]:
         librosa, np = self._require_modules()
-        if progress_cb:
-            progress_cb(10, "Carregando audio para recomendacao...")
-        y, sr = self._load_audio(track.resolved_source, target_sr=22050, librosa_module=librosa)
-        duration = max(librosa.get_duration(y=y, sr=sr), 1e-6)
+        track_data = self._get_or_load_track_data(track, librosa, progress_cb)
+        if track_data.feature_snapshot is not None:
+            if progress_cb:
+                progress_cb(100, "Features em cache prontas.")
+            return dict(track_data.feature_snapshot)
+        y, sr, duration = track_data.y, track_data.sr, track_data.duration_s
         if progress_cb:
             progress_cb(45, "Extraindo features principais...")
         tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
@@ -821,6 +1092,7 @@ class GenerationService:
             "flux_mean": float(np.mean(flux)) if len(flux) else 0.0,
             "boundaries_per_minute": boundaries_per_minute,
         }
+        track_data.feature_snapshot = dict(features)
         if progress_cb:
             progress_cb(100, "Features prontas.")
         return features
@@ -843,10 +1115,8 @@ class GenerationService:
             middle_bpm_multiplier=config_state.middle_speed_multiplier,
             show_youtube_video=False,
         )
-        if progress_cb:
-            progress_cb(12, "Carregando audio...")
-        with contextlib.redirect_stdout(io.StringIO()):
-            y, sr, duration = controller._load_audio_data(track.resolved_source, target_sr=22050)
+        track_data = self._get_or_load_track_data(track, librosa, progress_cb)
+        y, sr, duration = track_data.y, track_data.sr, track_data.duration_s
         n_frames = max(1, int(duration * controller.fps))
         if progress_cb:
             progress_cb(24, "Calculando BPM...")
@@ -879,7 +1149,7 @@ class GenerationService:
             temp_files.append(playback_source)
         if progress_cb:
             progress_cb(86, "Montando preview e resumo...")
-        features = self.extract_features(track)
+        features = dict(track_data.feature_snapshot) if track_data.feature_snapshot is not None else self.extract_features(track)
         preview_columns = build_preview_columns(led_patterns)
         if progress_cb:
             progress_cb(100, "Sequencia pronta.")
@@ -1178,6 +1448,11 @@ class PlaybackController(QWidget):
     def set_hardware_controller(self, hardware_controller: SerialHardwareController) -> None:
         self.hardware_controller = hardware_controller
 
+    def current_position_s(self) -> float:
+        if not self.session:
+            return 0.0
+        return self.session.position_s()
+
     def play(self, sequence: GeneratedSequence) -> None:
         if self.session and self.sequence is sequence and self._state == "paused":
             self.pause_toggle()
@@ -1262,6 +1537,102 @@ class PlaybackController(QWidget):
             self.frame_changed.emit(values)
             self._frame_idx_prev = frame_idx
         self.position_changed.emit(elapsed, duration)
+
+
+class ExternalVideoWindowController(QWidget):
+    state_changed = pyqtSignal(bool)
+    error = pyqtSignal(str)
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._process = QProcess(self)
+        self._process.setProcessChannelMode(QProcess.MergedChannels)
+        self._process.readyReadStandardOutput.connect(self._capture_process_output)
+        self._process.finished.connect(self._on_process_finished)
+        self._process.errorOccurred.connect(self._on_process_error)
+        self._process_output = ""
+        self._backend_name = ""
+
+    @property
+    def is_open(self) -> bool:
+        return self._process.state() != QProcess.NotRunning
+
+    @property
+    def backend_name(self) -> str:
+        return self._backend_name or "desconhecido"
+
+    def open(self, source: str, title: str, start_s: float = 0.0) -> None:
+        self.close()
+        self._process_output = ""
+        program, args = self._build_player_command(source, title, start_s)
+        env = QProcessEnvironment.systemEnvironment()
+        if env.contains("DISPLAY"):
+            self._process.setProcessEnvironment(env)
+        self._process.start(program, args)
+        if not self._process.waitForStarted(2500):
+            raise RuntimeError("Nao foi possivel abrir a janela externa de video.")
+        self._process.waitForFinished(350)
+        self._capture_process_output()
+        if self._process.state() == QProcess.NotRunning:
+            details = self._process_output.strip()
+            raise RuntimeError(details or "O reprodutor de video fechou logo apos iniciar.")
+        self.state_changed.emit(True)
+
+    def _build_player_command(self, source: str, title: str, start_s: float) -> Tuple[str, List[str]]:
+        mpv_bin = shutil.which("mpv")
+        if mpv_bin:
+            self._backend_name = "mpv"
+            args = [
+                "--force-window=yes",
+                "--idle=no",
+                "--no-terminal",
+                "--no-audio",
+                "--title=Video - " + title,
+                "--autofit=960x540",
+            ]
+            if start_s > 0.05:
+                args.append(f"--start={max(0.0, start_s):.3f}")
+            args.append(source)
+            return mpv_bin, args
+
+        ffplay_bin = shutil.which("ffplay")
+        if not ffplay_bin:
+            raise DependencyError("Nem mpv nem ffplay foram encontrados para abrir a janela de video.")
+        self._backend_name = "ffplay"
+        args = ["-autoexit", "-loglevel", "error", "-window_title", f"Video - {title}", "-an", "-x", "960", "-y", "540"]
+        if start_s > 0.05:
+            args.extend(["-ss", f"{max(0.0, start_s):.3f}"])
+        args.append(source)
+        return ffplay_bin, args
+
+    def close(self) -> None:
+        if not self.is_open:
+            self.state_changed.emit(False)
+            return
+        self._process.blockSignals(True)
+        self._process.terminate()
+        if not self._process.waitForFinished(1200):
+            self._process.kill()
+            self._process.waitForFinished(1200)
+        self._process.blockSignals(False)
+        self.state_changed.emit(False)
+
+    def _capture_process_output(self) -> None:
+        chunk = bytes(self._process.readAllStandardOutput()).decode(errors="ignore")
+        if chunk:
+            self._process_output += chunk
+
+    def _on_process_finished(self, _exit_code: int, _exit_status: QProcess.ExitStatus) -> None:
+        self._capture_process_output()
+        if self._process_output.strip():
+            self.error.emit(self._process_output.strip())
+        self.state_changed.emit(False)
+
+    def _on_process_error(self, _error: QProcess.ProcessError) -> None:
+        self._capture_process_output()
+        message = self._process_output.strip() or self._process.errorString().strip() or "Falha ao abrir a janela de video."
+        self.error.emit(message)
+        self.state_changed.emit(False)
 
 
 class LoadWorker(QThread):
@@ -1716,6 +2087,7 @@ class VisionAudioWindow(QMainWindow):
         self.hardware_controller = hardware_controller or SerialHardwareController()
         self.playback_controller = playback_controller or PlaybackController(self.hardware_controller)
         self.playback_controller.set_hardware_controller(self.hardware_controller)
+        self.video_window_controller = ExternalVideoWindowController(self)
 
         self.current_track: Optional[LoadedTrack] = None
         self.current_recommendation: Optional[RecommendationResult] = None
@@ -1734,6 +2106,8 @@ class VisionAudioWindow(QMainWindow):
         self.preview_panel: Optional[QFrame] = None
         self.monitor_column: Optional[QFrame] = None
         self.controls_column: Optional[QFrame] = None
+        self.player_bar: Optional[QFrame] = None
+        self.player_indent: Optional[QWidget] = None
 
         self.setWindowTitle(APP_TITLE)
         self.resize(1500, 980)
@@ -1789,6 +2163,30 @@ class VisionAudioWindow(QMainWindow):
                 font-size: 11px;
                 color: #7090ae;
                 font-weight: 600;
+            }
+            QToolButton#VideoWindowButton {
+                background: rgba(9, 16, 26, 0.22);
+                color: #90abc5;
+                border: 1px solid rgba(76, 106, 132, 0.55);
+                border-radius: 10px;
+                padding: 4px 8px;
+                font-size: 10px;
+                font-weight: 700;
+            }
+            QToolButton#VideoWindowButton:hover {
+                color: #d7e9f8;
+                border-color: #7fa5c3;
+                background: rgba(20, 34, 48, 0.5);
+            }
+            QToolButton#VideoWindowButton:checked {
+                color: #f6d48a;
+                border-color: #e0ae55;
+                background: rgba(68, 44, 12, 0.42);
+            }
+            QToolButton#VideoWindowButton:disabled {
+                color: #53687b;
+                border-color: rgba(56, 74, 88, 0.45);
+                background: rgba(6, 10, 16, 0.16);
             }
             QLabel#PositionLabel {
                 font-family: "DejaVu Sans Mono";
@@ -2055,24 +2453,34 @@ class VisionAudioWindow(QMainWindow):
         main_layout.setSpacing(14)
 
         main_layout.addWidget(self._build_header())
+        workspace = QHBoxLayout()
+        workspace.setContentsMargins(0, 0, 0, 0)
+        workspace.setSpacing(12)
+        self.monitor_column = self._build_monitor_column()
+        workspace.addWidget(self.monitor_column)
+
+        right_area = QWidget()
+        right_layout = QVBoxLayout(right_area)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(12)
+
         self.content_splitter = QSplitter(Qt.Horizontal)
         self.content_splitter.setObjectName("MainContentSplitter")
         self.content_splitter.setHandleWidth(10)
         self.content_splitter.setChildrenCollapsible(False)
-        self.monitor_column = self._build_monitor_column()
         self.controls_column = self._build_controls_column()
         self.preview_panel = self._build_preview_column()
-        self.content_splitter.addWidget(self.monitor_column)
         self.content_splitter.addWidget(self.controls_column)
         self.content_splitter.addWidget(self.preview_panel)
-        self.content_splitter.setStretchFactor(0, 0)
-        self.content_splitter.setStretchFactor(1, 1)
-        self.content_splitter.setStretchFactor(2, 0)
+        self.content_splitter.setStretchFactor(0, 1)
+        self.content_splitter.setStretchFactor(1, 0)
         self.content_splitter.setCollapsible(0, False)
-        self.content_splitter.setCollapsible(1, False)
-        self.content_splitter.setCollapsible(2, True)
-        main_layout.addWidget(self.content_splitter, 1)
-        main_layout.addWidget(self._build_player_bar())
+        self.content_splitter.setCollapsible(1, True)
+        right_layout.addWidget(self.content_splitter, 1)
+        self.player_bar = self._build_player_bar()
+        right_layout.addWidget(self.player_bar)
+        workspace.addWidget(right_area, 1)
+        main_layout.addLayout(workspace, 1)
         QTimer.singleShot(0, self._configure_initial_splitters)
 
     def _build_header(self) -> QFrame:
@@ -2094,6 +2502,7 @@ class VisionAudioWindow(QMainWindow):
         self.source_combo.addItem("Arquivo local", "local")
         self.source_combo.addItem("YouTube", "youtube")
         self.source_combo.currentIndexChanged.connect(self._on_source_mode_changed)
+        self.source_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         self.source_input = QLineEdit()
         self.source_input.setPlaceholderText("Selecione um arquivo ou digite uma busca/URL do YouTube")
         self.browse_button = QPushButton("Procurar")
@@ -2119,6 +2528,7 @@ class VisionAudioWindow(QMainWindow):
         bottom.setSpacing(8)
         self.port_combo = QComboBox()
         self.port_combo.setEditable(True)
+        self.port_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         if self.port_combo.lineEdit():
             self.port_combo.lineEdit().setPlaceholderText("/dev/ttyACM0")
         self.refresh_ports_button = QPushButton("Atualizar portas")
@@ -2134,7 +2544,7 @@ class VisionAudioWindow(QMainWindow):
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
-        bottom.addWidget(self.port_combo, 1)
+        bottom.addWidget(self.port_combo)
         bottom.addWidget(self.refresh_ports_button)
         bottom.addWidget(self.connect_button)
         bottom.addWidget(self.connection_label, 1)
@@ -2277,7 +2687,7 @@ class VisionAudioWindow(QMainWindow):
     def _build_profile_card(self) -> QFrame:
         card = QFrame()
         card.setObjectName("Card")
-        card.setMaximumHeight(112)
+        card.setMaximumHeight(156)
         layout = QVBoxLayout(card)
         layout.setContentsMargins(10, 8, 10, 8)
         layout.setSpacing(6)
@@ -2313,6 +2723,18 @@ class VisionAudioWindow(QMainWindow):
             slot_layout.addWidget(combo)
             row.addWidget(slot, 1)
         layout.addLayout(row)
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        self.load_config_button = QPushButton("Carregar JSON")
+        self.load_config_button.setProperty("variant", "secondary")
+        self.load_config_button.clicked.connect(self.load_config_json)
+        self.save_config_button = QPushButton("Salvar JSON")
+        self.save_config_button.setProperty("variant", "secondary")
+        self.save_config_button.clicked.connect(self.save_config_json)
+        actions.addWidget(self.load_config_button)
+        actions.addWidget(self.save_config_button)
+        actions.addStretch(1)
+        layout.addLayout(actions)
         return card
 
     def _build_primary_controls_card(self) -> QFrame:
@@ -2389,6 +2811,13 @@ class VisionAudioWindow(QMainWindow):
         self.player_state_label = QLabel("Idle")
         self.player_state_label.setObjectName("PlayerState")
         top.addWidget(self.player_title_label, 1)
+        self.video_window_button = QToolButton()
+        self.video_window_button.setObjectName("VideoWindowButton")
+        self.video_window_button.setText("video")
+        self.video_window_button.setCheckable(True)
+        self.video_window_button.setToolTip("Abrir o video em uma janela separada")
+        self.video_window_button.clicked.connect(self.toggle_video_window)
+        top.addWidget(self.video_window_button)
         top.addWidget(self.player_state_label)
         layout.addLayout(top)
 
@@ -2461,6 +2890,8 @@ class VisionAudioWindow(QMainWindow):
         self.playback_controller.frame_changed.connect(self.led_preview.set_levels)
         self.playback_controller.playback_finished.connect(self._on_playback_finished)
         self.playback_controller.playback_error.connect(self._on_playback_error)
+        self.video_window_controller.state_changed.connect(self._on_video_window_state_changed)
+        self.video_window_controller.error.connect(self._on_video_window_error)
 
     def _refresh_widget_style(self, widget: QWidget) -> None:
         widget.style().unpolish(widget)
@@ -2476,9 +2907,15 @@ class VisionAudioWindow(QMainWindow):
 
     def _configure_initial_splitters(self) -> None:
         if self.content_splitter is not None:
-            self.content_splitter.setSizes([260, 820, 360])
+            self.content_splitter.setSizes([820, 360])
         if self.monitor_splitter is not None:
             self.monitor_splitter.setSizes([150, 250])
+        self._sync_header_combo_widths()
+
+    def _sync_header_combo_widths(self) -> None:
+        combo_width = max(self.source_combo.sizeHint().width(), self.port_combo.sizeHint().width())
+        self.source_combo.setFixedWidth(combo_width)
+        self.port_combo.setFixedWidth(combo_width)
  
     def _on_source_mode_changed(self) -> None:
         mode = self.source_combo.currentData()
@@ -2574,17 +3011,22 @@ class VisionAudioWindow(QMainWindow):
         self.port_combo.setEnabled(not busy)
         self.refresh_ports_button.setEnabled(not busy)
         self.connect_button.setEnabled(not busy)
+        self.load_config_button.setEnabled(not busy)
+        self.save_config_button.setEnabled(not busy)
         self.suggest_button.setEnabled(not busy and self.current_track is not None)
         self.generate_button.setEnabled(not busy and self.current_track is not None)
         self.play_button.setEnabled(not busy and self.current_sequence is not None)
         player_state = getattr(self.playback_controller, "state", "idle")
         self.stop_button.setEnabled((not busy and self.current_sequence is not None) or player_state in ("playing", "paused"))
+        video_track = self._current_video_track()
+        self.video_window_button.setEnabled(not busy and video_track is not None and bool(video_track.youtube_video_url or video_track.youtube_page_url))
 
     def _finish_background_task(self) -> None:
         self._set_busy(False, status="error" if self._last_background_error else "ready")
 
     def load_track(self) -> None:
         self.stop_playback()
+        self.video_window_controller.close()
         mode = self.source_combo.currentData()
         value = self.source_input.text().strip()
         self._last_background_error = False
@@ -2641,10 +3083,75 @@ class VisionAudioWindow(QMainWindow):
             values=values,
         )
 
+    def apply_ui_state(self, state: UIConfigState) -> None:
+        normalized = state.normalized_values()
+        self.transition_profile_combo.setCurrentIndex(max(0, self.transition_profile_combo.findData(state.transition_profile)))
+        self.effect_profile_combo.setCurrentIndex(max(0, self.effect_profile_combo.findData(state.effect_profile)))
+        self.middle_speed_combo.setCurrentIndex(max(0, self.middle_speed_combo.findData(float(state.middle_speed_multiplier))))
+        for key, value in normalized.items():
+            if key in self._primary_controls:
+                self._primary_controls[key].set_value(value)
+                self._primary_controls[key].set_recommended(False)
+            elif key in self._spin_controls:
+                control = self._spin_controls[key]
+                control.blockSignals(True)
+                control.setValue(value)
+                control.blockSignals(False)
+                control.setStyleSheet("")
+
+    def save_config_json(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Salvar configuracao",
+            os.path.join(os.getcwd(), "visionaudio_config.json"),
+            "JSON (*.json)",
+        )
+        if not path:
+            return
+        payload = {
+            "app": APP_TITLE,
+            "version": 1,
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "config": self.current_ui_state().to_serializable(),
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as file_obj:
+                json.dump(payload, file_obj, indent=2, ensure_ascii=False)
+        except Exception as exc:
+            message, details = describe_exception(exc)
+            qt_message(self, "Salvar configuracao", message, "error", details)
+            self.log(f"Falha ao salvar configuracao: {message}", "error")
+            return
+        self.log(f"Configuracao salva em {path}.")
+
+    def load_config_json(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Carregar configuracao",
+            os.getcwd(),
+            "JSON (*.json)",
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as file_obj:
+                payload = json.load(file_obj)
+            config_payload = payload.get("config", payload)
+            state = UIConfigState.from_serializable(config_payload)
+            self.apply_ui_state(state)
+        except Exception as exc:
+            message, details = describe_exception(exc)
+            qt_message(self, "Carregar configuracao", message, "error", details)
+            self.log(f"Falha ao carregar configuracao: {message}", "error")
+            return
+        self.log(f"Configuracao carregada de {path}.")
+
     def handle_loaded_track(self, track: LoadedTrack) -> None:
+        self._cleanup_sequence_temp_files(self.current_sequence)
         self.current_track = track
         self.current_recommendation = None
         self.current_sequence = None
+        self.video_window_controller.close()
         self.track_title_label.setText(track.title)
         meta = [track.source_mode.upper(), track.display_source]
         if track.file_size_bytes is not None:
@@ -2676,11 +3183,12 @@ class VisionAudioWindow(QMainWindow):
         self.transition_profile_combo.setCurrentIndex(max(0, self.transition_profile_combo.findData(transition_profile)))
         self.effect_profile_combo.setCurrentIndex(max(0, self.effect_profile_combo.findData(effect_profile)))
         self.middle_speed_combo.setCurrentIndex(max(0, self.middle_speed_combo.findData(middle_speed)))
-        engine_label = "scikit-learn" if result.using_sklearn else "fallback interno"
+        engine_label = result.model_label or ("scikit-learn" if result.using_sklearn else "fallback interno")
         self.feature_summary_label.setText("\n".join(result.summary_lines + [f"Modelo: {engine_label}"]))
         self.log(f"Parâmetros sugeridos com {engine_label}.")
 
     def handle_generated_sequence(self, sequence: GeneratedSequence) -> None:
+        self._cleanup_sequence_temp_files(self.current_sequence)
         self.current_sequence = sequence
         self.timeline_widget.set_sequence(sequence)
         self.transition_list.clear()
@@ -2715,6 +3223,50 @@ class VisionAudioWindow(QMainWindow):
 
     def stop_playback(self) -> None:
         self.playback_controller.stop()
+        self.video_window_controller.close()
+
+    def _current_video_track(self) -> Optional[LoadedTrack]:
+        if self.current_sequence and (
+            self.current_sequence.track.youtube_video_url or self.current_sequence.track.youtube_page_url
+        ):
+            return self.current_sequence.track
+        if self.current_track and (self.current_track.youtube_video_url or self.current_track.youtube_page_url):
+            return self.current_track
+        return None
+
+    def toggle_video_window(self, checked: bool) -> None:
+        if not checked:
+            self.video_window_controller.close()
+            return
+        track = self._current_video_track()
+        if not track:
+            self.video_window_button.setChecked(False)
+            qt_message(self, "Video", "Nao ha video disponivel para a faixa atual.", "warn")
+            return
+        start_s = self.playback_controller.current_position_s()
+        try:
+            if track.youtube_video_url:
+                self.video_window_controller.open(track.youtube_video_url, track.title, start_s=start_s)
+                self.log(f"Janela de video aberta para {track.title} com {self.video_window_controller.backend_name}.")
+                return
+            if track.youtube_page_url:
+                if not webbrowser.open(track.youtube_page_url):
+                    raise RuntimeError("Nao foi possivel abrir o navegador para o video.")
+                self.log(f"Video aberto no navegador: {track.title}.")
+                self.video_window_button.setChecked(False)
+                return
+            raise RuntimeError("A faixa atual nao possui URL de video.")
+        except Exception as exc:
+            if track.youtube_page_url:
+                self.log("Falha ao abrir no ffplay. Tentando navegador...", "warn")
+                if webbrowser.open(track.youtube_page_url):
+                    self.video_window_button.setChecked(False)
+                    self.log(f"Video aberto no navegador: {track.title}.")
+                    return
+            self.video_window_button.setChecked(False)
+            message, details = describe_exception(exc)
+            qt_message(self, "Video", message, "error", details)
+            self.log(f"Falha ao abrir video: {message}", "error")
 
     def _on_playback_state_changed(self, state: str) -> None:
         labels = {
@@ -2726,6 +3278,16 @@ class VisionAudioWindow(QMainWindow):
         self.player_state_label.setText(labels.get(state, state))
         self.play_button.setText("⏸   Pause" if state == "playing" else "▶   Play")
         self._update_controls_enabled()
+
+    def _on_video_window_state_changed(self, opened: bool) -> None:
+        self.video_window_button.blockSignals(True)
+        self.video_window_button.setChecked(opened)
+        self.video_window_button.blockSignals(False)
+
+    def _on_video_window_error(self, message: str) -> None:
+        normalized = normalize_error_message(message, "VideoWindowError")
+        self.log(f"Falha na janela de video: {normalized}", "error")
+        qt_message(self, "Video", normalized, "error")
 
     def _on_playback_position_changed(self, elapsed: float, duration: float) -> None:
         self.position_label.setText(f"{format_seconds(elapsed)} / {format_seconds(duration)}")
@@ -2772,6 +3334,13 @@ class VisionAudioWindow(QMainWindow):
         if control is not None:
             control.setStyleSheet("")
 
+    def _cleanup_sequence_temp_files(self, sequence: Optional[GeneratedSequence]) -> None:
+        if not sequence:
+            return
+        for path in sequence.temp_files:
+            with contextlib.suppress(OSError):
+                os.remove(path)
+
     def restore_group_defaults(self, group_name: str) -> None:
         for key in self._group_fields.get(group_name, []):
             spec = CONTROL_SPECS[key]
@@ -2789,11 +3358,9 @@ class VisionAudioWindow(QMainWindow):
 
     def closeEvent(self, event: Any) -> None:
         self.stop_playback()
+        self.video_window_controller.close()
         self.hardware_controller.disconnect()
-        if self.current_sequence:
-            for path in self.current_sequence.temp_files:
-                with contextlib.suppress(OSError):
-                    os.remove(path)
+        self._cleanup_sequence_temp_files(self.current_sequence)
         super().closeEvent(event)
 
 
