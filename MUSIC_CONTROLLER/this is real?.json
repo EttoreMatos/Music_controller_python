@@ -1,0 +1,40 @@
+{
+  "app": "VisionAudio7",
+  "version": 1,
+  "saved_at": "2026-04-21 22:59:08",
+  "config": {
+    "transition_profile": "medium",
+    "effect_profile": "medium",
+    "middle_speed_multiplier": 2.0,
+    "values": {
+      "ACTIVE_MAX_PWM": 194,
+      "EDGE_PULSE_GAIN": 140,
+      "BEAT_BOOST_PWM": 25,
+      "MIDDLE_FADE_DECAY": 0.41,
+      "MIDDLE_EDGE_SYNC_GAIN": 90,
+      "TAIL_CUTOFF": 5.6,
+      "SEG_NOVELTY_THRESHOLD": 0.18,
+      "SEG_STRUCT_CHANGE_THRESHOLD": 0.16,
+      "TRANS_MAX_DURATION_S": 1.5,
+      "TRANS_BLEND_FRAMES": 6,
+      "ACTIVE_MIN_PWM": 68,
+      "MIDDLE_KICK_BRIGHT_GAIN": 120,
+      "MIDDLE_STRONG_KICK_BRIGHT_GAIN": 65,
+      "HEAVY_BEAT_THRESHOLD": 0.58,
+      "EDGE_HEAVY_BONUS_GAIN": 88,
+      "EDGE_KICK_WINDOW_BOOST": 200,
+      "EDGE_GATE_OPEN_THRESHOLD": 0.18,
+      "EDGE_GATE_CLOSE_THRESHOLD": 0.1,
+      "EDGE_GATE_MIN_LOW_DOMINANCE": 0.16,
+      "EDGE_NOISE_FLOOR_PWM": 12,
+      "EDGE_IDLE_DECAY": 0.78,
+      "NOISE_FLATNESS_THRESHOLD": 0.55,
+      "BRIGHT_CENTROID_THRESHOLD": 0.22,
+      "SEG_MIN_GAP_SECONDS": 1.4,
+      "SEG_MIN_ENERGY_THRESHOLD": 0.1,
+      "TRANS_MIN_DURATION_S": 0.45,
+      "BPM_RESYNC_STRENGTH": 0.85,
+      "BPM_CONTINUOUS_SYNC_STRENGTH": 0.06
+    }
+  }
+}
