@@ -1,9 +1,9 @@
 {
   "app": "VisionAudio7",
   "version": 1,
-  "saved_at": "2026-04-22 11:31:23",
+  "saved_at": "2026-05-12 22:28:21",
   "config": {
-    "transition_profile": "high",
+    "transition_profile": "medium",
     "effect_profile": "high",
     "middle_speed_multiplier": 2.0,
     "values": {
@@ -13,9 +13,9 @@
       "MIDDLE_FADE_DECAY": 0.4,
       "MIDDLE_EDGE_SYNC_GAIN": 144,
       "TAIL_CUTOFF": 6.0,
-      "SEG_NOVELTY_THRESHOLD": 0.05,
-      "SEG_STRUCT_CHANGE_THRESHOLD": 0.08,
-      "TRANS_MAX_DURATION_S": 1.88,
+      "SEG_NOVELTY_THRESHOLD": 0.06,
+      "SEG_STRUCT_CHANGE_THRESHOLD": 0.1,
+      "TRANS_MAX_DURATION_S": 1.31,
       "TRANS_BLEND_FRAMES": 4,
       "ACTIVE_MIN_PWM": 68,
       "MIDDLE_KICK_BRIGHT_GAIN": 120,
