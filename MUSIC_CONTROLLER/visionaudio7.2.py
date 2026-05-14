@@ -1796,35 +1796,35 @@ class LedPreviewWidget(QWidget):
 
             if any_active:
                 raw_level = level / 255.0
-                intensity = min(1.0, (raw_level ** 0.82) * 1.18)
-                glow_strength = min(1.0, raw_level * 1.32 + 0.08) if level > 0 else 0.0
+                intensity = min(1.0, (raw_level ** 0.70) * 1.42)
+                glow_strength = min(1.0, raw_level * 1.72 + 0.16) if level > 0 else 0.0
             else:
                 offset = idx * (math.pi / 3.0)
                 intensity = (math.sin(self._anim_phase + offset) + 1.0) * 0.5 * 0.18
                 glow_strength = intensity
 
             painter.setPen(Qt.NoPen)
-            for ring in (2, 1):
-                scale = 1.0 + ring * 0.32
-                alpha = int(max(0, min(120, (0.04 + 0.12 * glow_strength) * (3 - ring) * 90)))
+            for ring in (3, 2, 1):
+                scale = 1.0 + ring * 0.26
+                alpha = int(max(0, min(190, (0.08 + 0.20 * glow_strength) * (4 - ring) * 86)))
                 gc = QColor(base_color)
                 gc.setAlpha(alpha)
                 painter.setBrush(gc)
                 painter.drawEllipse(center, radius * scale, radius * scale)
 
-            flat_fill = QColor(base_color).lighter(int(118 + intensity * 55))
+            flat_fill = QColor(base_color).lighter(int(135 + intensity * 80))
             painter.setBrush(flat_fill)
             painter.drawEllipse(center, radius, radius)
 
             if intensity > 0.02:
-                inner_fill = QColor(base_color).lighter(int(150 + intensity * 50))
-                inner_fill.setAlpha(int(180 + intensity * 55))
+                inner_fill = QColor(base_color).lighter(int(180 + intensity * 70))
+                inner_fill.setAlpha(int(205 + intensity * 50))
                 painter.setBrush(inner_fill)
                 painter.drawEllipse(center, radius * 0.62, radius * 0.62)
 
-            rim = QColor(base_color).lighter(125)
-            rim.setAlpha(int(95 + intensity * 70))
-            painter.setPen(QPen(rim, 0.95))
+            rim = QColor(base_color).lighter(165)
+            rim.setAlpha(int(130 + intensity * 95))
+            painter.setPen(QPen(rim, 1.2))
             painter.setBrush(Qt.NoBrush)
             painter.drawEllipse(center, radius, radius)
 
@@ -1834,13 +1834,19 @@ class LedPreviewWidget(QWidget):
 
 
 class TimelineWidget(QWidget):
+    transition_moved = pyqtSignal(int, float)
+
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self.setMinimumHeight(132)
+        self.setMinimumHeight(180)
+        self.setMouseTracking(True)
+        self.setToolTip("Arraste os marcadores âmbar para reposicionar transições.")
         self.preview_columns: List[List[int]] = []
         self.transitions: List[Any] = []
         self.duration_s = 0.0
         self.position_s = 0.0
+        self._hover_transition_index: Optional[int] = None
+        self._drag_transition_index: Optional[int] = None
         self._ph_phase = 0.0
         self._ph_timer = QTimer(self)
         self._ph_timer.setInterval(40)
@@ -1868,10 +1874,94 @@ class TimelineWidget(QWidget):
         self.position_s = max(0.0, float(position_s))
         self.update()
 
+    def _timeline_rect(self) -> QRectF:
+        rect = QRectF(self.rect()).adjusted(8, 8, -8, -14)
+        return rect.adjusted(18, 34, -18, -32)
+
+    def _transition_x(self, index: int) -> Optional[float]:
+        if self.duration_s <= 0 or index < 0 or index >= len(self.transitions):
+            return None
+        inner = self._timeline_rect()
+        transition = self.transitions[index]
+        start_s = float(getattr(transition, "frame_start", 0)) / _CFG.FPS
+        ratio = max(0.0, min(1.0, start_s / self.duration_s))
+        return inner.left() + inner.width() * ratio
+
+    def _transition_at_pos(self, pos: QPointF) -> Optional[int]:
+        if not self.transitions or self.duration_s <= 0:
+            return None
+        inner = self._timeline_rect()
+        if pos.y() < inner.top() - 18 or pos.y() > inner.bottom() + 18:
+            return None
+        best_idx: Optional[int] = None
+        best_dist = 9999.0
+        for idx in range(len(self.transitions)):
+            tx = self._transition_x(idx)
+            if tx is None:
+                continue
+            dist = abs(float(pos.x()) - tx)
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = idx
+        return best_idx if best_dist <= 12.0 else None
+
+    def _move_transition_to_x(self, index: int, x_value: float) -> None:
+        if self.duration_s <= 0 or index < 0 or index >= len(self.transitions):
+            return
+        inner = self._timeline_rect()
+        ratio = (float(x_value) - inner.left()) / max(1.0, inner.width())
+        start_s = max(0.0, min(self.duration_s, ratio * self.duration_s))
+        transition = self.transitions[index]
+        fps = _CFG.FPS
+        duration_frames = max(1, int(getattr(transition, "frame_end", 0)) - int(getattr(transition, "frame_start", 0)))
+        max_start = max(0, int(round(self.duration_s * fps)) - duration_frames)
+        new_start = max(0, min(max_start, int(round(start_s * fps))))
+        transition.frame_start = new_start
+        transition.frame_end = new_start + duration_frames
+        self.transition_moved.emit(index, new_start / fps)
+        self.update()
+
+    def mousePressEvent(self, event: Any) -> None:
+        if event.button() == Qt.LeftButton:
+            idx = self._transition_at_pos(event.pos())
+            if idx is not None:
+                self._drag_transition_index = idx
+                self.setCursor(Qt.SizeHorCursor)
+                self._move_transition_to_x(idx, event.pos().x())
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: Any) -> None:
+        if self._drag_transition_index is not None:
+            self._move_transition_to_x(self._drag_transition_index, event.pos().x())
+            event.accept()
+            return
+        self._hover_transition_index = self._transition_at_pos(event.pos())
+        self.setCursor(Qt.SizeHorCursor if self._hover_transition_index is not None else Qt.ArrowCursor)
+        self.update()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: Any) -> None:
+        if event.button() == Qt.LeftButton and self._drag_transition_index is not None:
+            self._move_transition_to_x(self._drag_transition_index, event.pos().x())
+            self._drag_transition_index = None
+            self.setCursor(Qt.ArrowCursor)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def leaveEvent(self, event: Any) -> None:
+        self._hover_transition_index = None
+        if self._drag_transition_index is None:
+            self.setCursor(Qt.ArrowCursor)
+        self.update()
+        super().leaveEvent(event)
+
     def paintEvent(self, _event: Any) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        rect = self.rect().adjusted(8, 8, -8, -8)
+        rect = self.rect().adjusted(8, 8, -8, -14)
 
         bg = QLinearGradient(0, rect.top(), 0, rect.bottom())
         bg.setColorAt(0.0, QColor("#141f2e"))
@@ -1898,10 +1988,10 @@ class TimelineWidget(QWidget):
         if not self.preview_columns:
             painter.setPen(QColor("#6b7e96"))
             painter.setFont(QFont("DejaVu Sans", 10))
-            painter.drawText(QRectF(rect), Qt.AlignCenter, "O preview da sequência aparecerá aqui")
+            painter.drawText(QRectF(rect.adjusted(0, 0, 0, -8)), Qt.AlignCenter, "O preview da sequência aparecerá aqui")
             return
 
-        inner = rect.adjusted(16, 22, -16, -22)
+        inner = QRectF(self._timeline_rect())
 
         if self.duration_s > 0:
             ruler_y = rect.top() + 5
@@ -1937,21 +2027,23 @@ class TimelineWidget(QWidget):
                     painter.fillRect(QRectF(bx, inner.bottom() - bh, max(1.2, cw - 0.8), 1.5), cap_c)
 
         fps = _CFG.FPS
-        for transition in self.transitions:
+        for index, transition in enumerate(self.transitions):
             start_s = float(getattr(transition, "frame_start", 0)) / fps
             if self.duration_s <= 0:
                 continue
             tr = max(0.0, min(1.0, start_s / self.duration_s))
             tx = inner.left() + inner.width() * tr
-            painter.setPen(QPen(QColor(245, 158, 11, 110), 1.0, Qt.DashLine))
+            active = index == self._hover_transition_index or index == self._drag_transition_index
+            painter.setPen(QPen(QColor(245, 158, 11, 190 if active else 115), 1.4 if active else 1.0, Qt.DashLine))
             painter.drawLine(int(tx), int(inner.top()), int(tx), int(inner.bottom()))
             painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor("#f59e0b"))
+            painter.setBrush(QColor("#fbbf24" if active else "#f59e0b"))
             dm = QPainterPath()
-            dm.moveTo(tx, inner.top() - 2)
-            dm.lineTo(tx + 4, inner.top() + 5)
-            dm.lineTo(tx, inner.top() + 10)
-            dm.lineTo(tx - 4, inner.top() + 5)
+            marker = 5 if active else 4
+            dm.moveTo(tx, inner.top() - 3)
+            dm.lineTo(tx + marker, inner.top() + 5)
+            dm.lineTo(tx, inner.top() + 13)
+            dm.lineTo(tx - marker, inner.top() + 5)
             dm.closeSubpath()
             painter.drawPath(dm)
 
@@ -2191,7 +2283,7 @@ class VisionAudioWindow(QMainWindow):
                 font-style: italic;
             }
             QLabel#PlayerTitle {
-                font-size: 14px;
+                font-size: 12px;
                 font-weight: 700;
                 color: #e8f2ff;
                 letter-spacing: 0.4px;
@@ -2685,12 +2777,12 @@ class VisionAudioWindow(QMainWindow):
                 background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
                     stop:0 #182240, stop:1 #0e1628);
                 border: 1px solid rgba(0, 180, 220, 0.32);
-                border-radius: 24px;
+                border-radius: 18px;
                 color: #4a7898;
-                font-size: 16px;
+                font-size: 14px;
                 font-weight: 700;
-                min-width: 48px; max-width: 48px;
-                min-height: 48px; max-height: 48px;
+                min-width: 36px; max-width: 36px;
+                min-height: 36px; max-height: 36px;
                 padding: 0px;
             }
             QPushButton#TransportBtn:hover {
@@ -2714,9 +2806,9 @@ class VisionAudioWindow(QMainWindow):
                     stop:0 #fbbf24, stop:0.45 #f59e0b, stop:1 #d97706);
                 border: 1px solid #fcd34d;
                 color: #0d0800;
-                min-width: 56px; max-width: 56px;
-                min-height: 56px; max-height: 56px;
-                border-radius: 28px;
+                min-width: 34px; max-width: 34px;
+                min-height: 34px; max-height: 34px;
+                border-radius: 17px;
             }
             QPushButton#TransportBtn[accent="true"]:hover {
                 background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
@@ -2746,17 +2838,17 @@ class VisionAudioWindow(QMainWindow):
                 border-radius: 3px;
             }
             QSlider#Scrubber::handle:horizontal {
-                width: 16px; height: 16px;
-                margin: -6px 0;
-                border-radius: 8px;
+                width: 12px; height: 12px;
+                margin: -4px 0;
+                border-radius: 6px;
                 background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                    stop:0 #e8f4ff, stop:1 #00b8e0);
-                border: 1px solid #007090;
+                    stop:0 #69e4ff, stop:0.48 #00b8e0, stop:1 #007fb8);
+                border: 1px solid #08111a;
             }
             QSlider#Scrubber::handle:horizontal:hover {
                 background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                    stop:0 #ffffff, stop:1 #00d4ff);
-                border-color: #00a8d0;
+                    stop:0 #b8f4ff, stop:1 #00d4ff);
+                border-color: #102034;
             }
 
             /* ── Profile slot ── */
@@ -2914,7 +3006,7 @@ class VisionAudioWindow(QMainWindow):
         btn.setObjectName("TransportBtn")
         btn.setText("")
         btn.setIcon(self.style().standardIcon(standard_pixmap))
-        btn.setIconSize(QSize(20, 20))
+        btn.setIconSize(QSize(16 if not accent else 14, 16 if not accent else 14))
         btn.setToolTip(tooltip)
         btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         btn.setFocusPolicy(Qt.StrongFocus)
@@ -2987,8 +3079,9 @@ class VisionAudioWindow(QMainWindow):
         self.connect_button = QPushButton("Conectar Arduino")
         self.connect_button.setProperty("variant", "primary")
         self.connect_button.clicked.connect(self.toggle_connection)
-        self.connection_label = QLabel("Arduino desconectado")
+        self.connection_label = QLabel("")
         self.connection_label.setObjectName("SectionMeta")
+        self.connection_label.setVisible(False)
         self.progress_label = QLabel("Aguardando ação")
         self.progress_label.setObjectName("SectionMeta")
         self.progress_bar = QProgressBar()
@@ -2997,7 +3090,6 @@ class VisionAudioWindow(QMainWindow):
         bottom.addWidget(self.port_combo)
         bottom.addWidget(self.refresh_ports_button)
         bottom.addWidget(self.connect_button)
-        bottom.addWidget(self.connection_label, 1)
         bottom.addWidget(self.progress_label, 1)
         bottom.addWidget(self.progress_bar, 1)
         layout.addLayout(bottom)
@@ -3057,23 +3149,18 @@ class VisionAudioWindow(QMainWindow):
         )
         layout.addWidget(self.feature_summary_label)
 
-        self.timeline_widget = TimelineWidget()
-        self.timeline_widget.setMinimumHeight(300)
-        layout.addWidget(self.timeline_widget, 1)
+        timeline_header = QHBoxLayout()
+        timeline_header.setSpacing(8)
+        timeline_title = QLabel("Preview geral")
+        timeline_title.setObjectName("SectionTitle")
+        timeline_header.addWidget(timeline_title)
+        timeline_header.addStretch(1)
+        layout.addLayout(timeline_header)
 
-        overview = QFrame()
-        overview.setObjectName("InsetCard")
-        overview_layout = QVBoxLayout(overview)
-        overview_layout.setContentsMargins(10, 10, 10, 10)
-        overview_layout.setSpacing(6)
-        overview_title = QLabel("Preview geral")
-        overview_title.setObjectName("SectionTitle")
-        overview_body = QLabel("Mapa principal da sequencia, estrutura e playback ao vivo.")
-        overview_body.setWordWrap(True)
-        overview_body.setObjectName("SectionMeta")
-        overview_layout.addWidget(overview_title)
-        overview_layout.addWidget(overview_body)
-        layout.addWidget(overview)
+        self.timeline_widget = TimelineWidget()
+        self.timeline_widget.setMinimumHeight(240)
+        self.timeline_widget.transition_moved.connect(self._on_timeline_transition_moved)
+        layout.addWidget(self.timeline_widget, 1)
         return card
 
     def _build_transition_panel(self) -> QFrame:
@@ -3237,10 +3324,11 @@ class VisionAudioWindow(QMainWindow):
     def _build_player_bar(self) -> QFrame:
         card = QFrame()
         card.setObjectName("PlayerBar")
-        card.setMinimumHeight(148)
+        card.setMinimumHeight(112)
+        card.setMaximumHeight(118)
         outer = QVBoxLayout(card)
-        outer.setContentsMargins(16, 12, 16, 12)
-        outer.setSpacing(6)
+        outer.setContentsMargins(12, 6, 12, 6)
+        outer.setSpacing(3)
 
         top = QHBoxLayout()
         top.setSpacing(10)
@@ -3261,15 +3349,18 @@ class VisionAudioWindow(QMainWindow):
 
         chrome = QFrame()
         chrome.setObjectName("PlayerChrome")
+        chrome.setMinimumHeight(66)
+        chrome.setMaximumHeight(72)
         inner = QVBoxLayout(chrome)
-        inner.setContentsMargins(14, 4, 14, 12)
-        inner.setSpacing(12)
+        inner.setContentsMargins(14, 3, 14, 6)
+        inner.setSpacing(2)
 
         transport_row = QWidget()
-        transport_row.setMinimumHeight(46)
+        transport_row.setMinimumHeight(42)
+        transport_row.setMaximumHeight(42)
         transport = QHBoxLayout(transport_row)
-        transport.setContentsMargins(0, 0, 0, 2)
-        transport.setSpacing(14)
+        transport.setContentsMargins(0, 0, 0, 0)
+        transport.setSpacing(10)
         transport.addStretch(1)
 
         self.seek_back_button = self._make_transport_button(
@@ -3288,17 +3379,17 @@ class VisionAudioWindow(QMainWindow):
         )
         self.seek_forward_button.clicked.connect(lambda: self.playback_controller.seek_relative(SEEK_STEP_S))
 
-        transport.addWidget(self.seek_back_button)
-        transport.addWidget(self.play_button)
-        transport.addWidget(self.stop_button)
-        transport.addWidget(self.seek_forward_button)
+        transport.addWidget(self.seek_back_button, 0, Qt.AlignCenter)
+        transport.addWidget(self.play_button, 0, Qt.AlignCenter)
+        transport.addWidget(self.stop_button, 0, Qt.AlignCenter)
+        transport.addWidget(self.seek_forward_button, 0, Qt.AlignCenter)
         transport.addStretch(1)
         inner.addWidget(transport_row)
 
         time_row_w = QWidget()
-        time_row_w.setMinimumHeight(26)
+        time_row_w.setMinimumHeight(18)
         time_row = QHBoxLayout(time_row_w)
-        time_row.setContentsMargins(0, 0, 0, 2)
+        time_row.setContentsMargins(0, 0, 0, 0)
         self.position_label = QLabel("0:00 / --:--")
         self.position_label.setObjectName("PositionLabel")
         self.position_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
@@ -3451,7 +3542,7 @@ class VisionAudioWindow(QMainWindow):
         try:
             if self.hardware_controller.is_connected:
                 self.hardware_controller.disconnect()
-                self.connection_label.setText("Arduino desconectado")
+                self.connection_label.setText("")
                 self.connect_button.setText("Conectar Arduino")
                 self.connect_button.setProperty("variant", "primary")
                 self._refresh_widget_style(self.connect_button)
@@ -3464,11 +3555,11 @@ class VisionAudioWindow(QMainWindow):
             if not port:
                 raise ValueError("Selecione uma porta serial.")
             self.hardware_controller.connect_port(port)
-            self.connection_label.setText(f"Arduino conectado em {port}")
+            self.connection_label.setText("")
             self.connect_button.setText("Desconectar Arduino")
             self.connect_button.setProperty("variant", "secondary")
             self._refresh_widget_style(self.connect_button)
-            self.progress_label.setText(f"Arduino conectado em {port}")
+            self.progress_label.setText("Arduino conectado.")
             self.progress_bar.setValue(0)
             self._set_status_badge("ready")
             self.log(f"Arduino conectado em {port}.")
@@ -3688,13 +3779,7 @@ class VisionAudioWindow(QMainWindow):
         self._cleanup_sequence_temp_files(self.current_sequence)
         self.current_sequence = sequence
         self.timeline_widget.set_sequence(sequence)
-        self.transition_list.clear()
-        for transition in sequence.transitions:
-            start_s = float(getattr(transition, "frame_start", 0)) / sequence.effect_config.FPS
-            end_s = float(getattr(transition, "frame_end", 0)) / sequence.effect_config.FPS
-            effect = getattr(getattr(transition, "effect_type", None), "name", "TRANS")
-            item = QListWidgetItem(f"{format_seconds(start_s)}  {effect}  dur {max(0.0, end_s - start_s):.2f}s")
-            self.transition_list.addItem(item)
+        self._refresh_transition_list()
         self.player_title_label.setText(f"{sequence.track.title} | {sequence.tempo_bpm:.1f} BPM")
         self.feature_summary_label.setText(
             "\n".join(
@@ -3708,6 +3793,24 @@ class VisionAudioWindow(QMainWindow):
         )
         self.log(f"Sequencia gerada para {sequence.track.title}.")
         self._update_controls_enabled()
+
+    def _refresh_transition_list(self, selected_index: Optional[int] = None) -> None:
+        self.transition_list.clear()
+        if not self.current_sequence:
+            return
+        sequence = self.current_sequence
+        for transition in sequence.transitions:
+            start_s = float(getattr(transition, "frame_start", 0)) / sequence.effect_config.FPS
+            end_s = float(getattr(transition, "frame_end", 0)) / sequence.effect_config.FPS
+            effect = getattr(getattr(transition, "effect_type", None), "name", "TRANS")
+            item = QListWidgetItem(f"{format_seconds(start_s)}  {effect}  dur {max(0.0, end_s - start_s):.2f}s")
+            self.transition_list.addItem(item)
+        if selected_index is not None and 0 <= selected_index < self.transition_list.count():
+            self.transition_list.setCurrentRow(selected_index)
+
+    def _on_timeline_transition_moved(self, index: int, start_s: float) -> None:
+        _ = start_s
+        self._refresh_transition_list(index)
 
     def toggle_playback(self) -> None:
         if not self.current_sequence:
