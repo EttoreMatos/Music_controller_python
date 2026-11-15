@@ -43,6 +43,7 @@ from PyQt5.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
+    QGraphicsDropShadowEffect,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -1342,7 +1343,7 @@ class PlaybackController(QWidget):
             return 0.0
         return self.session.position_s()
 
-    def play(self, sequence: GeneratedSequence) -> None:
+    def play(self, sequence: GeneratedSequence, start_s: float = 0.0) -> None:
         if self.session and self.sequence is sequence and self._state == "paused":
             self.pause_toggle()
             return
@@ -1358,6 +1359,8 @@ class PlaybackController(QWidget):
             message, _details = describe_exception(exc)
             self.playback_error.emit(message)
             return
+        if start_s > 0.05 and self.session.supports_seek:
+            self.session.seek(float(start_s))
         self._frame_idx_prev = -1
         self._state = "playing"
         self.state_changed.emit(self._state)
@@ -1387,6 +1390,14 @@ class PlaybackController(QWidget):
 
     def seek_relative(self, delta_s: int) -> None:
         if self.session and self.session.seek(delta_s):
+            self._frame_idx_prev = -1
+
+    def seek_to(self, seconds: float) -> None:
+        """Vai exatamente para `seconds` (precisão de décimos, não de segundos inteiros)."""
+        if not self.session or not self.session.supports_seek or not self.sequence:
+            return
+        delta = float(seconds) - self.session.position_s()
+        if self.session.seek(delta):
             self._frame_idx_prev = -1
 
     def seek_ratio(self, ratio: float) -> None:
@@ -1664,7 +1675,7 @@ QLabel[role="title"] { font-size: 12pt; font-weight: 700; color: #e8f2ff; }
 QLabel[role="section"] { color: $accent2; font-size: 8pt; font-weight: 800; }
 QLabel[role="value"] { color: $text; }
 QLabel[role="metric"] { color: #ffd26d; font-weight: 700; }
-QLabel[role="clock"] { font-size: 13pt; font-weight: 700; font-family: "DejaVu Sans Mono", monospace; color: #e8f4ff; }
+QLabel[role="clock"] { font-size: 15pt; font-weight: 700; font-family: "DejaVu Sans Mono", monospace; color: #e8f4ff; }
 QLabel[role="chip"] {
     background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #0c1020, stop:1 #070a14);
     border-top: 1px solid rgba(0, 180, 220, 0.28);
@@ -1724,12 +1735,18 @@ QToolButton:disabled { color: $faint; background: #090c18; border: 1px solid rgb
 QToolButton:checked { color: #fbbf24; border: 1px solid #f59e0b; background: rgba(245, 158, 11, 0.15); }
 QToolButton[role="play"] {
     background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #fbbf24, stop:0.45 #f59e0b, stop:1 #d97706);
-    border: 1px solid #b45309; border-top: 2px solid #fcd34d; border-radius: 18px;
+    border: 1px solid #b45309; border-top: 2px solid #fcd34d; border-radius: 23px;
 }
 QToolButton[role="play"]:hover { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #fde68a, stop:0.45 #fbbf24, stop:1 #f59e0b); }
 QToolButton[role="play"]:disabled { background: #2a1f0a; border: 1px solid #3a2a10; }
 QToolButton#DockClose { background: transparent; border: none; color: $dim; padding: 2px 7px; border-radius: 6px; }
 QToolButton#DockClose:hover { background: rgba(0, 180, 220, 0.14); color: $accent2; }
+
+QToolButton[role="transport"] { border-radius: 17px; padding: 0px; }
+QLabel#PlayerState { color: $dim; font-weight: 700; padding: 3px 11px; border-radius: 10px; background: rgba(255, 255, 255, 0.05); }
+QLabel#PlayerState[state="playing"] { color: $ok; background: rgba(52, 211, 153, 0.14); }
+QLabel#PlayerState[state="paused"] { color: $warn; background: rgba(251, 191, 36, 0.14); }
+QLabel#PlayerState[state="error"] { color: $err; background: rgba(248, 113, 113, 0.14); }
 
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
     background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #0c1020, stop:1 #070a14);
@@ -1933,7 +1950,65 @@ def _icon_copy(p: QPainter, color: QColor) -> None:
     p.drawRoundedRect(QRectF(4, 3, 11, 13), 2, 2)
 
 
+def _icon_zoom_in(p: QPainter, color: QColor) -> None:
+    pen = QPen(color, 2.2)
+    pen.setCapStyle(Qt.RoundCap)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+    p.drawEllipse(QRectF(3.5, 3.5, 12.0, 12.0))
+    p.drawLine(QPointF(14.0, 14.0), QPointF(20.5, 20.5))
+    p.drawLine(QPointF(9.5, 6.8), QPointF(9.5, 12.2))
+    p.drawLine(QPointF(6.8, 9.5), QPointF(12.2, 9.5))
+
+
+def _icon_zoom_out(p: QPainter, color: QColor) -> None:
+    pen = QPen(color, 2.2)
+    pen.setCapStyle(Qt.RoundCap)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+    p.drawEllipse(QRectF(3.5, 3.5, 12.0, 12.0))
+    p.drawLine(QPointF(14.0, 14.0), QPointF(20.5, 20.5))
+    p.drawLine(QPointF(6.8, 9.5), QPointF(12.2, 9.5))
+
+
+def _icon_fit(p: QPainter, color: QColor) -> None:
+    pen = QPen(color, 2.2)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+    p.drawPolyline(QPolygonF([QPointF(8, 5), QPointF(4, 5), QPointF(4, 19), QPointF(8, 19)]))
+    p.drawPolyline(QPolygonF([QPointF(16, 5), QPointF(20, 5), QPointF(20, 19), QPointF(16, 19)]))
+    p.drawLine(QPointF(8.5, 12), QPointF(15.5, 12))
+    p.setPen(Qt.NoPen)
+    p.setBrush(color)
+    _poly(p, [(8.0, 12), (11.0, 9.2), (11.0, 14.8)])
+    _poly(p, [(16.0, 12), (13.0, 9.2), (13.0, 14.8)])
+
+
+def _icon_follow(p: QPainter, color: QColor) -> None:
+    pen = QPen(color, 2.2)
+    pen.setCapStyle(Qt.RoundCap)
+    p.setPen(pen)
+    p.drawLine(QPointF(7.0, 4.0), QPointF(7.0, 20.0))
+    p.setPen(Qt.NoPen)
+    p.setBrush(color)
+    _poly(p, [(11.5, 7.0), (21.0, 12.0), (11.5, 17.0)])
+
+
+def _icon_prev_marker(p: QPainter, color: QColor) -> None:
+    _rrect(p, 4, 5, 2.8, 14, 1)
+    _poly(p, [(19.5, 5), (8.5, 12), (19.5, 19)])
+
+
+def _icon_next_marker(p: QPainter, color: QColor) -> None:
+    _rrect(p, 17.2, 5, 2.8, 14, 1)
+    _poly(p, [(4.5, 5), (15.5, 12), (4.5, 19)])
+
+
 _ICON_SHAPES = {
+    "zoom_in": _icon_zoom_in, "zoom_out": _icon_zoom_out, "fit": _icon_fit, "follow": _icon_follow,
+    "prev_marker": _icon_prev_marker, "next_marker": _icon_next_marker,
     "play": _icon_play, "pause": _icon_pause, "stop": _icon_stop, "back": _icon_back,
     "forward": _icon_forward, "folder": _icon_folder, "download": _icon_download,
     "spark": _icon_spark, "bolt": _icon_bolt, "refresh": _icon_refresh,
@@ -1996,33 +2071,19 @@ def mix_color(base: str, other: str, t: float) -> QColor:
 # ----------------------------------------------------------------------------
 
 class LedMonitorWidget(QWidget):
-    """Os 6 LEDs como orbes brilhantes numa pílula de vidro (visual do 7.2)."""
+    """Os 6 LEDs como orbes numa pílula de vidro. Parados: cinza com um leve tom da cor, sem efeito."""
     LABELS = ("E", "1", "2", "3", "4", "E")
+    EDGE_COLOR = "#2fd27a"          # pontas: verdes
+    IDLE_BODY = "#3a4553"           # cinza-azulado base dos orbes apagados
+    IDLE_RIM = "#2a3441"
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._levels = [0] * 6
-        self._phase = 0.0
         self.setMinimumHeight(98)
-        self._timer = QTimer(self)
-        self._timer.setInterval(40)
-        self._timer.timeout.connect(self._tick)
 
     def sizeHint(self) -> QSize:
         return QSize(250, 102)
-
-    def showEvent(self, event: Any) -> None:
-        self._timer.start()
-        super().showEvent(event)
-
-    def hideEvent(self, event: Any) -> None:
-        self._timer.stop()
-        super().hideEvent(event)
-
-    def _tick(self) -> None:
-        self._phase = (self._phase + 0.07) % (2 * math.pi)
-        if not any(v > 8 for v in self._levels):        # respiração suave só em repouso
-            self.update()
 
     def set_levels(self, levels: Sequence[int]) -> None:
         values = [int(v) for v in list(levels)[:6]]
@@ -2054,7 +2115,6 @@ class LedMonitorWidget(QWidget):
         painter.setPen(hl_pen)
         painter.drawLine(QPointF(rect.left() + 22, rect.top()), QPointF(rect.right() - 22, rect.top()))
 
-        any_active = any(v > 8 for v in self._levels)
         slot = rect.width() / 6.0
         radius = max(5.0, min(slot * 0.30, (rect.height() - 40.0) / 2.0))
         cy = rect.top() + 18.0 + radius          # orbes mais abaixo do título da seção
@@ -2063,33 +2123,34 @@ class LedMonitorWidget(QWidget):
         for idx, level in enumerate(self._levels):
             cx = rect.left() + slot * (idx + 0.5)
             center = QPointF(cx, cy)
-            base = QColor(PALETTE["edge"] if idx in (0, 5) else PALETTE["mid"])
-            if any_active:
+            base = QColor(self.EDGE_COLOR if idx in (0, 5) else PALETTE["mid"])
+            if level > 8:
                 raw = level / 255.0
                 intensity = min(1.0, (raw ** 0.70) * 1.42)
-                glow = min(1.0, raw * 1.72 + 0.16) if level > 0 else 0.0
-            else:
-                intensity = (math.sin(self._phase + idx * (math.pi / 3.0)) + 1.0) * 0.5 * 0.18
-                glow = intensity
-            painter.setPen(Qt.NoPen)
-            for ring in (3, 2, 1):
-                scale = 1.0 + ring * 0.26
-                halo = QColor(base)
-                halo.setAlpha(int(max(0, min(190, (0.08 + 0.20 * glow) * (4 - ring) * 86))))
-                painter.setBrush(halo)
-                painter.drawEllipse(center, radius * scale, radius * scale)
-            painter.setBrush(QColor(base).lighter(int(135 + intensity * 80)))
-            painter.drawEllipse(center, radius, radius)
-            if intensity > 0.02:
+                glow = min(1.0, raw * 1.72 + 0.16)
+                painter.setPen(Qt.NoPen)
+                for ring in (3, 2, 1):
+                    scale = 1.0 + ring * 0.26
+                    halo = QColor(base)
+                    halo.setAlpha(int(max(0, min(190, (0.08 + 0.20 * glow) * (4 - ring) * 86))))
+                    painter.setBrush(halo)
+                    painter.drawEllipse(center, radius * scale, radius * scale)
+                painter.setBrush(QColor(base).lighter(int(135 + intensity * 80)))
+                painter.drawEllipse(center, radius, radius)
                 inner = QColor(base).lighter(int(180 + intensity * 70))
                 inner.setAlpha(int(205 + intensity * 50))
                 painter.setBrush(inner)
                 painter.drawEllipse(center, radius * 0.62, radius * 0.62)
-            rim = QColor(base).lighter(165)
-            rim.setAlpha(int(130 + intensity * 95))
-            painter.setPen(QPen(rim, 1.2))
-            painter.setBrush(Qt.NoBrush)
-            painter.drawEllipse(center, radius, radius)
+                rim = QColor(base).lighter(165)
+                rim.setAlpha(int(130 + intensity * 95))
+                painter.setPen(QPen(rim, 1.2))
+                painter.setBrush(Qt.NoBrush)
+                painter.drawEllipse(center, radius, radius)
+            else:
+                # apagado: cinza liso com um toque da cor do LED — sem brilho, sem anel, sem animação
+                painter.setPen(QPen(mix_color(self.IDLE_RIM, base.name(), 0.14), 1.0))
+                painter.setBrush(mix_color(self.IDLE_BODY, base.name(), 0.16))
+                painter.drawEllipse(center, radius, radius)
             painter.setFont(font)
             painter.setPen(QColor(90, 140, 190, 140))
             painter.drawText(QRectF(cx - 12, rect.bottom() - 17, 24, 13), Qt.AlignCenter, self.LABELS[idx])
@@ -2101,56 +2162,77 @@ class LedMonitorWidget(QWidget):
 # ----------------------------------------------------------------------------
 
 class TimelineWidget(QWidget):
-    """Partitura dos 6 LEDs com zoom e rolagem.
+    """Partitura dos 6 LEDs com zoom, rolagem e navegação.
 
-    Zoom:    roda do mouse (ancorado no cursor) · Ctrl+= / Ctrl+- / Ctrl+0 (menu Ver)
-    Rolagem: Shift+roda · botão do meio arrastando · barra de visão geral embaixo
-    Textura: "pads" de step sequencer (estilo FL Studio) sobre uma grade de tempos/compassos.
+    Zoom:      roda do mouse (no ponto do cursor) · botões −/+/Ajustar · duplo clique
+    Rolagem:   Shift+roda ou gesto horizontal · botão do meio/direito arrastando · setas ← →
+    Minimapa:  barra inferior com o perfil de energia, transições e drops; arraste a janela para
+               navegar e as bordas dela para dar zoom
+    Pads:      textura de step sequencer (estilo FL Studio) sobre a grade de tempos/compassos
+    Pontos:    o indicador de cada faixa pisca com o LED correspondente durante a reprodução
     """
-    seek_requested = pyqtSignal(float)          # segundos
+    seek_requested = pyqtSignal(float)              # segundos
+    view_changed = pyqtSignal(float, float, float)  # início, janela e duração (s)
+    follow_changed = pyqtSignal(bool)
+
+    GLOSSY = True
 
     LANE_NAMES = ("PONTA E", "LED 1", "LED 2", "LED 3", "LED 4", "PONTA D")
-    GUTTER = 80.0
+    GUTTER = 92.0
     RULER_H = 34.0
-    OVERVIEW_H = 12.0
+    OVERVIEW_H = 24.0
     LANE_GAP = 2.0
     MIN_SPAN_S = 3.0            # zoom máximo: janela de 3 s
     MIN_CELL_PX = 4.0           # largura mínima de cada pad
     PAD_LEVELS = 24             # níveis de brilho quantizados (cache dos gradientes)
+    EDGE_GRAB_PX = 6.0
+    ENVELOPE_BUCKETS = 480
     TICK_STEPS = (0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self.setMinimumHeight(190)
+        self.setMinimumHeight(200)
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.ClickFocus)
         self._lanes: List[List[int]] = []
         self._columns = 0
         self._duration = 0.0
         self._fps = 30
         self._bpm = 0.0
         self._position = 0.0
+        self._cue = 0.0
+        self._live = [0] * 6
         self._transitions: List[Tuple[float, float, str]] = []
         self._drops: List[float] = []
+        self._envelope: List[float] = []
         self._hover_x: Optional[float] = None
         self._seek_x: Optional[float] = None
-        self._hover_marker: Optional[int] = None
+        self._hover_marker: Optional[Tuple[str, int]] = None
         self._view_start = 0.0
         self._view_span = 0.0
         self._follow = True
         self._pan_anchor: Optional[Tuple[float, float]] = None
-        self._ov_grab: Optional[float] = None
+        self._ov_mode: Optional[str] = None
+        self._ov_grab = 0.0
+        self._serial = 0
         self._cache: Optional[QPixmap] = None
         self._cache_key: Optional[tuple] = None
+        self._ov_cache: Optional[QPixmap] = None
+        self._ov_key: Optional[tuple] = None
 
     # -- dados --------------------------------------------------------------
     def set_sequence(self, sequence: Optional[GeneratedSequence]) -> None:
         self._lanes = []
         self._transitions = []
         self._drops = []
+        self._envelope = []
         self._position = 0.0
+        self._cue = 0.0
         self._duration = 0.0
         self._columns = 0
         self._bpm = 0.0
+        self._live = [0] * 6
+        self._serial += 1
         self._cache = None
         self._cache_key = None
         if sequence is not None and sequence.preview_lanes:
@@ -2165,23 +2247,61 @@ class TimelineWidget(QWidget):
                 name = getattr(getattr(transition, "effect_type", None), "name", "TRANS")
                 self._transitions.append((start, end, name))
             self._drops = [float(d) for d in (sequence.report or {}).get("drops_s", [])]
+            buckets = self.ENVELOPE_BUCKETS
+            envelope = [0.0] * buckets
+            for index, column in enumerate(self._lanes):
+                bucket = min(buckets - 1, index * buckets // self._columns)
+                energy = sum(column) / (6.0 * 255.0)
+                if energy > envelope[bucket]:
+                    envelope[bucket] = energy
+            self._envelope = envelope
         self._view_start = 0.0
         self._view_span = self._duration
-        self._follow = True
+        self.set_follow(True)
         self._clamp_view()
 
     def set_position(self, seconds: float) -> None:
         self._position = max(0.0, float(seconds))
-        if self._follow and self.is_zoomed() and self._pan_anchor is None and self._ov_grab is None:
-            margin = self._view_span * 0.08
-            if self._position > self._view_start + self._view_span - margin or self._position < self._view_start:
-                self._view_start = self._position - margin
-                self._clamp_view()
+        self._chase_playhead()
         self.update()
+
+    def set_cue(self, seconds: float) -> None:
+        self._cue = max(0.0, float(seconds))
+        self.update()
+
+    def set_live_levels(self, levels: Sequence[int]) -> None:
+        values = [max(0, min(255, int(v))) for v in list(levels)[:6]]
+        values += [0] * (6 - len(values))
+        if values == self._live:
+            return
+        self._live = values
+        self.update(0, 0, int(self.GUTTER), self.height())      # só a coluna dos nomes
 
     # -- zoom / rolagem -----------------------------------------------------
     def is_zoomed(self) -> bool:
         return self._duration > 0 and self._view_span < self._duration - 1e-6
+
+    def set_follow(self, flag: bool) -> None:
+        flag = bool(flag)
+        changed = flag != self._follow
+        self._follow = flag
+        if changed:
+            self.follow_changed.emit(flag)
+        if flag:
+            self._chase_playhead()
+
+    def _release_follow(self) -> None:
+        if self._follow:
+            self._follow = False
+            self.follow_changed.emit(False)
+
+    def _chase_playhead(self) -> None:
+        if not (self._follow and self.is_zoomed()) or self._pan_anchor is not None or self._ov_mode is not None:
+            return
+        margin = self._view_span * 0.08
+        if self._position > self._view_start + self._view_span - margin or self._position < self._view_start:
+            self._view_start = self._position - margin
+            self._clamp_view()
 
     def _clamp_view(self) -> None:
         if self._duration <= 0 or self._columns == 0:
@@ -2191,6 +2311,7 @@ class TimelineWidget(QWidget):
             low = min(self.MIN_SPAN_S, self._duration)
             self._view_span = max(low, min(self._duration, self._view_span))
             self._view_start = max(0.0, min(self._duration - self._view_span, self._view_start))
+        self.view_changed.emit(self._view_start, self._view_span, self._duration)
         self.update()
 
     def zoom_by(self, factor: float, anchor_x: Optional[float] = None) -> None:
@@ -2218,13 +2339,21 @@ class TimelineWidget(QWidget):
     def zoom_fit(self) -> None:
         self._view_start = 0.0
         self._view_span = self._duration
-        self._follow = True
         self._clamp_view()
+        self.set_follow(True)
 
     def pan_by(self, seconds: float) -> None:
         self._view_start += seconds
-        self._follow = False
+        self._release_follow()
         self._clamp_view()
+
+    def reveal(self, seconds: float) -> None:
+        """Garante que `seconds` esteja visível (sem mexer no modo de seguir)."""
+        if self._view_span <= 0:
+            return
+        if seconds < self._view_start or seconds > self._view_start + self._view_span:
+            self._view_start = seconds - self._view_span * 0.3
+            self._clamp_view()
 
     # -- geometria ----------------------------------------------------------
     def _lanes_rect(self) -> QRectF:
@@ -2247,40 +2376,84 @@ class TimelineWidget(QWidget):
         frac = max(0.0, min(1.0, (x - rect.left()) / rect.width()))
         return self._view_start + frac * self._view_span
 
-    def _marker_at(self, x: float, y: float) -> Optional[int]:
+    def _marker_at(self, x: float, y: float) -> Optional[Tuple[str, int]]:
         if y > self.RULER_H + 2:
             return None
         rect = self._lanes_rect()
-        for index, (start, _end, _name) in enumerate(self._transitions):
-            mx = self._x_of(start)
-            if rect.left() - 4 <= mx <= rect.right() + 4 and abs(mx - x) <= 6.0:
-                return index
-        return None
+        best: Optional[Tuple[str, int]] = None
+        best_dist = 7.0
+        candidates = [("t", i, start) for i, (start, _e, _n) in enumerate(self._transitions)]
+        candidates += [("d", i, sec) for i, sec in enumerate(self._drops)]
+        for kind, index, seconds in candidates:
+            mx = self._x_of(seconds)
+            if rect.left() - 4 <= mx <= rect.right() + 4 and abs(mx - x) < best_dist:
+                best, best_dist = (kind, index), abs(mx - x)
+        return best
+
+    def _marker_seconds(self, key: Tuple[str, int]) -> float:
+        kind, index = key
+        return self._transitions[index][0] if kind == "t" else self._drops[index]
 
     def _overview_rect(self) -> QRectF:
         rect = self._lanes_rect()
-        return QRectF(rect.left(), rect.bottom() + 5.0, rect.width(), self.OVERVIEW_H - 2.0)
+        return QRectF(rect.left(), rect.bottom() + 6.0, rect.width(), self.OVERVIEW_H - 4.0)
 
     def _handle_rect(self) -> QRectF:
         ov = self._overview_rect()
-        if self._duration <= 0 or not self.is_zoomed():
+        if self._duration <= 0:
             return QRectF(ov)
-        width = min(ov.width(), max(18.0, ov.width() * self._view_span / self._duration))
-        free = self._duration - self._view_span
-        frac = self._view_start / free if free > 1e-9 else 0.0
-        return QRectF(ov.left() + (ov.width() - width) * frac, ov.top(), width, ov.height())
+        width = min(ov.width(), max(10.0, self._view_span / self._duration * ov.width()))
+        left = ov.left() + self._view_start / self._duration * ov.width()
+        left = max(ov.left(), min(ov.right() - width, left))
+        return QRectF(left, ov.top(), width, ov.height())
+
+    def _in_overview(self, y: float) -> bool:
+        return y >= self._overview_rect().top() - 4.0
+
+    def _overview_zone(self, x: float) -> Tuple[str, float]:
+        """Qual parte da janela do minimapa está sob x: borda esquerda 'l', direita 'r' ou corpo 'm'."""
+        handle = self._handle_rect()
+        grab = self.EDGE_GRAB_PX
+        if handle.width() >= 3 * grab:
+            if abs(x - handle.left()) <= grab:
+                return "l", 0.0
+            if abs(x - handle.right()) <= grab:
+                return "r", 0.0
+        if handle.left() - 1 <= x <= handle.right() + 1:
+            return "m", x - handle.left()
+        return "m", handle.width() / 2.0
 
     def _drag_overview(self, x: float) -> None:
         ov = self._overview_rect()
-        handle = self._handle_rect()
-        free_px = ov.width() - handle.width()
-        left = max(ov.left(), min(ov.right() - handle.width(), x - (self._ov_grab or 0.0)))
-        frac = (left - ov.left()) / free_px if free_px > 0 else 0.0
-        self._view_start = frac * (self._duration - self._view_span)
-        self._follow = False
+        if ov.width() <= 0 or self._duration <= 0:
+            return
+        low = min(self.MIN_SPAN_S, self._duration)
+        t = max(0.0, min(self._duration, (x - ov.left()) / ov.width() * self._duration))
+        if self._ov_mode == "m":
+            self._view_start = (x - self._ov_grab - ov.left()) / ov.width() * self._duration
+        elif self._ov_mode == "l":
+            end = self._view_start + self._view_span
+            start = min(t, end - low)
+            self._view_start, self._view_span = start, end - start
+        elif self._ov_mode == "r":
+            end = max(t, self._view_start + low)
+            self._view_span = end - self._view_start
+        self._release_follow()
         self._clamp_view()
 
-    # -- mouse --------------------------------------------------------------
+    def _update_hover_cursor(self, x: float, y: float) -> None:
+        if self._in_overview(y):
+            zone, _ = self._overview_zone(x)
+            if zone in ("l", "r"):
+                self.setCursor(Qt.SizeHorCursor)
+            else:
+                self.setCursor(Qt.OpenHandCursor if self.is_zoomed() else Qt.ArrowCursor)
+        elif self._hover_marker is not None:
+            self.setCursor(Qt.PointingHandCursor)
+        else:
+            self.unsetCursor()
+
+    # -- mouse / teclado ----------------------------------------------------
     def wheelEvent(self, event: Any) -> None:
         if not self._columns:
             event.ignore()
@@ -2294,19 +2467,47 @@ class TimelineWidget(QWidget):
             self.zoom_by(0.85 ** (delta.y() / 120.0), float(event.pos().x()))
         event.accept()
 
+    def keyPressEvent(self, event: Any) -> None:
+        if not self._columns or int(event.modifiers()) & ~int(Qt.KeypadModifier):
+            super().keyPressEvent(event)
+            return
+        key = event.key()
+        if key == Qt.Key_Left:
+            self.pan_by(-self._view_span * 0.15)
+        elif key == Qt.Key_Right:
+            self.pan_by(self._view_span * 0.15)
+        elif key in (Qt.Key_Plus, Qt.Key_Equal):
+            self.zoom_in()
+        elif key in (Qt.Key_Minus, Qt.Key_Underscore):
+            self.zoom_out()
+        elif key == Qt.Key_0:
+            self.zoom_fit()
+        elif key == Qt.Key_Home:
+            self._view_start = 0.0
+            self._release_follow()
+            self._clamp_view()
+        elif key == Qt.Key_End:
+            self._view_start = self._duration
+            self._release_follow()
+            self._clamp_view()
+        else:
+            super().keyPressEvent(event)
+            return
+        event.accept()
+
     def mouseMoveEvent(self, event: Any) -> None:
         if not self._columns:
             return
         pos = event.pos()
         x, y = float(pos.x()), float(pos.y())
-        if self._ov_grab is not None:
+        if self._ov_mode is not None:
             self._drag_overview(x)
             return
         if self._pan_anchor is not None:
             anchor_x, anchor_start = self._pan_anchor
             rect = self._lanes_rect()
             self._view_start = anchor_start - (x - anchor_x) / max(1.0, rect.width()) * self._view_span
-            self._follow = False
+            self._release_follow()
             self._clamp_view()
             return
         self._hover_x = x
@@ -2314,10 +2515,16 @@ class TimelineWidget(QWidget):
         if marker != self._hover_marker:
             self._hover_marker = marker
             if marker is not None:
-                start, end, name = self._transitions[marker]
-                QToolTip.showText(event.globalPos(), f"{name}  ·  {format_clock(start)}  ·  duração {max(0.0, end - start):.2f}s")
+                kind, index = marker
+                if kind == "t":
+                    start, end, name = self._transitions[index]
+                    text = f"{name.title()}  ·  {format_clock(start)}  ·  duração {max(0.0, end - start):.2f}s"
+                else:
+                    text = f"DROP  ·  {format_clock(self._drops[index])}"
+                QToolTip.showText(event.globalPos(), text)
             else:
                 QToolTip.hideText()
+        self._update_hover_cursor(x, y)
         if self._seek_x is not None:
             self._seek_x = x
         self.update()
@@ -2325,45 +2532,56 @@ class TimelineWidget(QWidget):
     def mousePressEvent(self, event: Any) -> None:
         if not self._columns:
             return
+        self.setFocus(Qt.MouseFocusReason)
         x, y = float(event.pos().x()), float(event.pos().y())
-        if event.button() == Qt.MiddleButton:
+        if event.button() in (Qt.MiddleButton, Qt.RightButton):
             self._pan_anchor = (x, self._view_start)
             self.setCursor(Qt.ClosedHandCursor)
             return
         if event.button() != Qt.LeftButton:
             return
-        if self.is_zoomed() and self._overview_rect().adjusted(0, -4, 0, 4).contains(x, y):
-            handle = self._handle_rect()
-            self._ov_grab = (x - handle.left()) if handle.contains(x, y) else handle.width() / 2.0
+        if self._in_overview(y):
+            self._ov_mode, self._ov_grab = self._overview_zone(x)
+            self.setCursor(Qt.SizeHorCursor if self._ov_mode in ("l", "r") else Qt.ClosedHandCursor)
             self._drag_overview(x)
             return
-        self._seek_x = x
-        self.update()
+        rect = self._lanes_rect()
+        if rect.left() <= x <= rect.right() and y <= rect.bottom():
+            self._seek_x = x
+            self.update()
 
     def mouseReleaseEvent(self, event: Any) -> None:
-        if event.button() == Qt.MiddleButton and self._pan_anchor is not None:
+        x, y = float(event.pos().x()), float(event.pos().y())
+        if event.button() in (Qt.MiddleButton, Qt.RightButton) and self._pan_anchor is not None:
             self._pan_anchor = None
-            self.unsetCursor()
+            self._update_hover_cursor(x, y)
             return
         if event.button() != Qt.LeftButton:
             return
-        if self._ov_grab is not None:
-            self._ov_grab = None
+        if self._ov_mode is not None:
+            self._ov_mode = None
+            self._update_hover_cursor(x, y)
             return
         if self._seek_x is None or not self._columns:
             return
-        x, y = float(event.pos().x()), float(event.pos().y())
         marker = self._marker_at(x, y)
-        seconds = self._transitions[marker][0] if marker is not None else self._seconds_of(x)
+        seconds = self._marker_seconds(marker) if marker is not None else self._seconds_of(x)
         self._seek_x = None
-        self._follow = True
+        self.set_follow(True)
         self.update()
         self.seek_requested.emit(seconds)
 
     def mouseDoubleClickEvent(self, event: Any) -> None:
-        pos = event.pos()
-        if event.button() == Qt.LeftButton and self._overview_rect().adjusted(0, -4, 0, 4).contains(float(pos.x()), float(pos.y())):
-            self.zoom_fit()          # duplo clique na barra de visão geral: ajustar à janela
+        if not self._columns or event.button() != Qt.LeftButton:
+            super().mouseDoubleClickEvent(event)
+            return
+        x, y = float(event.pos().x()), float(event.pos().y())
+        rect = self._lanes_rect()
+        if self._in_overview(y) or (rect.left() <= x <= rect.right() and y <= rect.bottom()):
+            if self.is_zoomed():
+                self.zoom_fit()                       # duplo clique: ajustar à janela
+            else:
+                self.zoom_by(0.2, x if not self._in_overview(y) else None)
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
@@ -2371,6 +2589,7 @@ class TimelineWidget(QWidget):
     def leaveEvent(self, _event: Any) -> None:
         self._hover_x = None
         self._hover_marker = None
+        self.unsetCursor()
         self.update()
 
     # -- pintura ------------------------------------------------------------
@@ -2390,7 +2609,7 @@ class TimelineWidget(QWidget):
     def _lanes_pixmap(self, rect: QRectF) -> QPixmap:
         """Faixas já pintadas (pads + grade). Só é refeito quando zoom/rolagem/tamanho mudam."""
         dpr = self.devicePixelRatioF()
-        key = (int(rect.width()), int(rect.height()), round(self._view_start, 4), round(self._view_span, 4), dpr)
+        key = (int(rect.width()), int(rect.height()), round(self._view_start, 4), round(self._view_span, 4), dpr, self._serial)
         if self._cache is not None and self._cache_key == key:
             return self._cache
         pixmap = QPixmap(max(1, int(rect.width() * dpr)), max(1, int(rect.height() * dpr)))
@@ -2424,10 +2643,13 @@ class TimelineWidget(QWidget):
         beat_line = QColor(255, 255, 255, 16)
         bar_line = QColor(255, 255, 255, 44)
         empty_pad = QColor(255, 255, 255, 10)
-        lane_grad = QLinearGradient(0.0, 0.0, 0.0, lane_h)
-        lane_grad.setColorAt(0.0, QColor("#0c1020"))
-        lane_grad.setColorAt(1.0, QColor("#070a14"))
-        lane_bg = QBrush(lane_grad)
+        if self.GLOSSY:
+            lane_grad = QLinearGradient(0.0, 0.0, 0.0, lane_h)
+            lane_grad.setColorAt(0.0, QColor("#0c1020"))
+            lane_grad.setColorAt(1.0, QColor("#070a14"))
+            lane_bg = QBrush(lane_grad)
+        else:
+            lane_bg = QBrush(QColor(PALETTE["bg0"]))
         levels = self.PAD_LEVELS
         brushes: Dict[Tuple[bool, int], QBrush] = {}
 
@@ -2453,7 +2675,8 @@ class TimelineWidget(QWidget):
             p.translate(0.0, lane * (lane_h + gap))
             p.setClipRect(QRectF(0.0, 0.0, w, lane_h))
             p.fillRect(QRectF(0.0, 0.0, w, lane_h), lane_bg)
-            p.fillRect(QRectF(0.0, 0.0, w, 1.0), QColor(0, 200, 240, 24))
+            if self.GLOSSY:
+                p.fillRect(QRectF(0.0, 0.0, w, 1.0), QColor(0, 200, 240, 24))
 
             if show_grid:
                 b0 = int(math.floor(view_start / beat_s))
@@ -2487,6 +2710,33 @@ class TimelineWidget(QWidget):
                 p.fillRect(QRectF(cell.left(), cell.top(), cell.width(), 1.0), QColor(255, 255, 255, int(70 * t)))
             p.restore()
 
+    def _overview_pixmap(self, ov: QRectF) -> QPixmap:
+        """Minimapa: perfil de energia da música + transições e drops."""
+        dpr = self.devicePixelRatioF()
+        key = (int(ov.width()), int(ov.height()), dpr, self._serial)
+        if self._ov_cache is not None and self._ov_key == key:
+            return self._ov_cache
+        w, h = max(1, int(ov.width())), max(1, int(ov.height()))
+        pixmap = QPixmap(int(w * dpr), int(h * dpr))
+        pixmap.setDevicePixelRatio(dpr)
+        pixmap.fill(Qt.transparent)
+        p = QPainter(pixmap)
+        p.setRenderHint(QPainter.Antialiasing, False)
+        p.fillRect(QRectF(0, 0, w, h), QColor(0, 0, 0, 120))
+        if self._envelope and self._duration > 0:
+            count = len(self._envelope)
+            for px in range(w):
+                energy = self._envelope[min(count - 1, int(px / float(w) * count))]
+                bar_h = max(1.0, (h - 3.0) * min(1.0, energy * 1.15))
+                p.fillRect(QRectF(px, h - 1.0 - bar_h, 1.0, bar_h), QColor(40, 200, 248, 150))
+            for start, _end, _name in self._transitions:
+                p.fillRect(QRectF(int(start / self._duration * w), 0.0, 1.0, h), QColor(245, 158, 11, 190))
+            for seconds in self._drops:
+                p.fillRect(QRectF(int(seconds / self._duration * w) - 1, 0.0, 2.0, h), QColor(167, 139, 250, 220))
+        p.end()
+        self._ov_cache, self._ov_key = pixmap, key
+        return pixmap
+
     def paintEvent(self, _event: Any) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
@@ -2502,17 +2752,35 @@ class TimelineWidget(QWidget):
             painter.end()
             return
 
-        # faixas (pads + grade em cache) e rótulos
+        # faixas (pads + grade em cache)
         painter.drawPixmap(rect.topLeft(), self._lanes_pixmap(rect))
+
+        # indicadores das faixas: piscam com o LED correspondente
         lane_h = self._lane_height(rect)
         for lane in range(6):
             top = rect.top() + lane * (lane_h + self.LANE_GAP)
-            dot = QColor(PALETTE["edge"] if lane in (0, 5) else PALETTE["mid"])
+            base = QColor(PALETTE["edge"] if lane in (0, 5) else PALETTE["mid"])
+            t = (self._live[lane] / 255.0) ** 0.7
+            center = QPointF(17.0, top + lane_h / 2.0)
+            radius = 5.0 + 1.3 * t
             painter.setPen(Qt.NoPen)
-            painter.setBrush(dot)
-            painter.drawEllipse(QPointF(14.0, top + lane_h / 2.0), 3.0, 3.0)
-            painter.setPen(QColor(PALETTE["dim"]))
-            painter.drawText(QRectF(24.0, top, self.GUTTER - 28.0, lane_h), Qt.AlignVCenter | Qt.AlignLeft, self.LANE_NAMES[lane])
+            if t > 0.03:
+                for scale, alpha in ((2.5, 0.14), (1.8, 0.30)):
+                    halo = QColor(base)
+                    halo.setAlphaF(alpha * t)
+                    painter.setBrush(halo)
+                    painter.drawEllipse(center, radius * scale, radius * scale)
+            unlit = mix_color(PALETTE["bg0"], base.name(), 0.38)
+            painter.setBrush(mix_color(unlit.name(), base.lighter(125).name(), t))
+            rim = base.lighter(150)
+            rim.setAlpha(int(70 + 150 * t))
+            painter.setPen(QPen(rim, 1.1))
+            painter.drawEllipse(center, radius, radius)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(255, 255, 255, int(40 + 150 * t)))
+            painter.drawEllipse(QPointF(center.x() - radius * 0.30, center.y() - radius * 0.32), radius * 0.28, radius * 0.28)
+            painter.setPen(mix_color(PALETTE["dim"], PALETTE["text"], t))
+            painter.drawText(QRectF(34.0, top, self.GUTTER - 38.0, lane_h), Qt.AlignVCenter | Qt.AlignLeft, self.LANE_NAMES[lane])
 
         # régua
         view_end = self._view_start + self._view_span
@@ -2521,16 +2789,16 @@ class TimelineWidget(QWidget):
         painter.setPen(QPen(QColor(PALETTE["border2"]), 1))
         painter.drawLine(QPointF(rect.left(), self.RULER_H - 2), QPointF(rect.right(), self.RULER_H - 2))
         for k in range(int(math.floor(self._view_start / step)), int(math.ceil(view_end / step)) + 1):
-            t = k * step
-            x = self._x_of(t)
+            t_s = k * step
+            x = self._x_of(t_s)
             if x < rect.left() - 0.5 or x > rect.right() + 0.5:
                 continue
             painter.setPen(QPen(QColor(PALETTE["border2"]), 1))
             painter.drawLine(QPointF(x, self.RULER_H - 7), QPointF(x, self.RULER_H - 2))
-            painter.setPen(QColor(PALETTE["dim"]))
-            label = self._tick_label(t, step)
+            label = self._tick_label(t_s, step)
             if x + 3 + painter.fontMetrics().horizontalAdvance(label) > self.width() - 2:
                 continue
+            painter.setPen(QColor(PALETTE["dim"]))
             painter.drawText(QRectF(x + 3, 3, 56, 13), Qt.AlignLeft | Qt.AlignVCenter, label)
 
         # transições
@@ -2570,7 +2838,7 @@ class TimelineWidget(QWidget):
 
         # hover / seek
         guide_x = self._seek_x if self._seek_x is not None else self._hover_x
-        if guide_x is not None and rect.left() <= guide_x <= rect.right() and self._ov_grab is None:
+        if guide_x is not None and rect.left() <= guide_x <= rect.right() and self._ov_mode is None:
             painter.setPen(QPen(QColor(PALETTE["text"]), 1, Qt.DotLine))
             painter.drawLine(QPointF(guide_x, self.RULER_H - 2), QPointF(guide_x, rect.bottom()))
             label = format_clock(self._seconds_of(guide_x))
@@ -2578,34 +2846,218 @@ class TimelineWidget(QWidget):
             painter.setPen(QColor(PALETTE["text"]))
             painter.drawText(QRectF(guide_x + 4, rect.bottom() - 18, 56, 15), Qt.AlignCenter, label)
 
+        # ponto de início (cue): onde a reprodução começa quando está parada
+        if self._cue > 0.01:
+            cx = self._x_of(self._cue)
+            if rect.left() - 1 <= cx <= rect.right() + 1:
+                ok = QColor(PALETTE["ok"])
+                painter.setPen(QPen(ok, 1.2, Qt.DashLine))
+                painter.drawLine(QPointF(cx, self.RULER_H - 2), QPointF(cx, rect.bottom()))
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(ok)
+                _poly(painter, [(cx, self.RULER_H - 14), (cx + 9, self.RULER_H - 10), (cx, self.RULER_H - 6)])
+
         # playhead
         px = self._x_of(self._position)
         if rect.left() - 1 <= px <= rect.right() + 1:
-            for width, alpha in ((7.0, 22), (4.0, 38)):
-                painter.setPen(QPen(QColor(240, 248, 255, alpha), width))
-                painter.drawLine(QPointF(px, self.RULER_H - 2), QPointF(px, rect.bottom()))
-            painter.setPen(QPen(QColor("#eef4fc"), 1.8))
+            if self.GLOSSY:
+                for width, alpha in ((7.0, 22), (4.0, 38)):
+                    painter.setPen(QPen(QColor(240, 248, 255, alpha), width))
+                    painter.drawLine(QPointF(px, self.RULER_H - 2), QPointF(px, rect.bottom()))
+                head = QColor("#eef4fc")
+            else:
+                head = QColor(PALETTE["accent2"])
+            painter.setPen(QPen(head, 1.8))
             painter.drawLine(QPointF(px, self.RULER_H - 2), QPointF(px, rect.bottom()))
             painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor("#eef4fc"))
+            painter.setBrush(head)
             _poly(painter, [(px - 5, self.RULER_H - 12), (px + 5, self.RULER_H - 12), (px, self.RULER_H - 3)])
 
-        # barra de visão geral (só tem o que mostrar quando há zoom)
+        # minimapa de navegação
         ov = self._overview_rect()
+        painter.drawPixmap(ov.topLeft(), self._overview_pixmap(ov))
+        handle = self._handle_rect()
         painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(PALETTE["bg0"]))
-        painter.drawRoundedRect(ov, 3, 3)
-        if self.is_zoomed():
-            handle = self._handle_rect()
-            fill = QColor(PALETTE["accent2"])
-            fill.setAlphaF(0.55 if self._ov_grab is not None else 0.35)
-            painter.setBrush(fill)
-            painter.drawRoundedRect(handle, 3, 3)
-            ratio = self._position / self._duration if self._duration > 0 else 0.0
-            ox = ov.left() + max(0.0, min(1.0, ratio)) * ov.width()
-            painter.setPen(QPen(QColor(PALETTE["accent2"]), 1.2))
+        painter.setBrush(QColor(0, 0, 0, 120))
+        painter.drawRect(QRectF(ov.left(), ov.top(), max(0.0, handle.left() - ov.left()), ov.height()))
+        painter.drawRect(QRectF(handle.right(), ov.top(), max(0.0, ov.right() - handle.right()), ov.height()))
+        accent = QColor(PALETTE["accent2"])
+        fill = QColor(accent)
+        fill.setAlphaF(0.22 if self._ov_mode is not None else (0.12 if self.is_zoomed() else 0.05))
+        outline = QColor(accent)
+        outline.setAlphaF(0.95 if self.is_zoomed() else 0.35)
+        painter.setPen(QPen(outline, 1.2))
+        painter.setBrush(fill)
+        painter.drawRoundedRect(handle.adjusted(0.5, 0.5, -0.5, -0.5), 3, 3)
+        if handle.width() >= 18 and self.is_zoomed():
+            painter.setPen(QPen(outline, 1.6, Qt.SolidLine, Qt.RoundCap))
+            mid = handle.center().y()
+            for gx in (handle.left() + 3.5, handle.right() - 3.5):
+                painter.drawLine(QPointF(gx, mid - 3.5), QPointF(gx, mid + 3.5))
+        if self._duration > 0:
+            ox = ov.left() + max(0.0, min(1.0, self._position / self._duration)) * ov.width()
+            painter.setPen(QPen(QColor("#eef4fc"), 1.4))
             painter.drawLine(QPointF(ox, ov.top()), QPointF(ox, ov.bottom()))
         painter.end()
+
+
+class SeekBar(QWidget):
+    """Barra de progresso do player: clique/arraste para navegar, com marcas de transições e drops."""
+    seek_requested = pyqtSignal(float)              # segundos
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setFixedHeight(36)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self._duration = 0.0
+        self._position = 0.0
+        self._cue = 0.0
+        self._transitions: List[float] = []
+        self._drops: List[float] = []
+        self._hover_x: Optional[float] = None
+        self._drag_x: Optional[float] = None
+
+    def set_sequence(self, sequence: Optional[GeneratedSequence]) -> None:
+        self._transitions = []
+        self._drops = []
+        self._position = 0.0
+        self._cue = 0.0
+        self._duration = 0.0
+        if sequence is not None:
+            fps = float(max(1, sequence.fps))
+            self._duration = max(0.0, float(sequence.duration_s))
+            self._transitions = [float(getattr(t, "frame_start", 0)) / fps for t in sequence.transitions]
+            self._drops = [float(d) for d in (sequence.report or {}).get("drops_s", [])]
+        self.update()
+
+    def set_position(self, seconds: float) -> None:
+        self._position = max(0.0, float(seconds))
+        self.update()
+
+    def set_cue(self, seconds: float) -> None:
+        self._cue = max(0.0, float(seconds))
+        self.update()
+
+    def _track(self) -> QRectF:
+        return QRectF(12.0, self.height() - 15.0, max(10.0, self.width() - 24.0), 6.0)
+
+    def _x_of(self, seconds: float) -> float:
+        track = self._track()
+        if self._duration <= 0:
+            return track.left()
+        return track.left() + max(0.0, min(1.0, seconds / self._duration)) * track.width()
+
+    def _seconds_of(self, x: float) -> float:
+        track = self._track()
+        return max(0.0, min(1.0, (x - track.left()) / max(1.0, track.width()))) * self._duration
+
+    def mouseMoveEvent(self, event: Any) -> None:
+        self._hover_x = float(event.pos().x())
+        if self._drag_x is not None:
+            self._drag_x = self._hover_x
+        self.update()
+
+    def mousePressEvent(self, event: Any) -> None:
+        if event.button() == Qt.LeftButton and self._duration > 0:
+            self._drag_x = float(event.pos().x())
+            self.update()
+
+    def mouseReleaseEvent(self, event: Any) -> None:
+        if event.button() == Qt.LeftButton and self._drag_x is not None:
+            seconds = self._seconds_of(float(event.pos().x()))
+            self._drag_x = None
+            self.update()
+            self.seek_requested.emit(seconds)
+
+    def leaveEvent(self, _event: Any) -> None:
+        self._hover_x = None
+        self.update()
+
+    def paintEvent(self, _event: Any) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        track = self._track()
+        active = self._duration > 0
+
+        # ranhura
+        p.setPen(QPen(QColor(255, 255, 255, 16), 1.0))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(track.adjusted(-0.6, -0.6, 0.6, 1.2), 3.5, 3.5)
+        groove = QLinearGradient(track.topLeft(), track.bottomLeft())
+        groove.setColorAt(0.0, QColor("#010204"))
+        groove.setColorAt(1.0, QColor("#0e1521"))
+        p.setPen(QPen(QColor("#04070c"), 1.0))
+        p.setBrush(QBrush(groove))
+        p.drawRoundedRect(track, 3, 3)
+        if not active:
+            p.end()
+            return
+
+        # marcas: transições (âmbar) e drops (violeta)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(245, 158, 11, 200))
+        for seconds in self._transitions:
+            p.drawRect(QRectF(self._x_of(seconds) - 0.75, track.top() - 5.0, 1.5, 4.0))
+        p.setBrush(QColor(PALETTE["drop"]))
+        for seconds in self._drops:
+            p.drawRect(QRectF(self._x_of(seconds) - 1.0, track.top() - 8.0, 2.0, 7.0))
+
+        shown = self._seconds_of(self._drag_x) if self._drag_x is not None else self._position
+        px = self._x_of(shown)
+
+        # progresso luminoso
+        fill = QRectF(track.left(), track.top() + 1.0, max(0.0, px - track.left()), track.height() - 2.0)
+        if fill.width() > 0.5:
+            grad = QLinearGradient(fill.topLeft(), fill.topRight())
+            grad.setColorAt(0.0, QColor("#0891b2"))
+            grad.setColorAt(1.0, QColor("#7defff"))
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(0, 212, 255, 46))
+            p.drawRoundedRect(fill.adjusted(0.0, -2.0, 0.0, 2.0), 4, 4)
+            p.setBrush(QBrush(grad))
+            p.drawRoundedRect(fill, 2.5, 2.5)
+
+        # ponto de início (cue)
+        if self._cue > 0.01:
+            cx = self._x_of(self._cue)
+            ok = QColor(PALETTE["ok"])
+            p.setPen(Qt.NoPen)
+            p.setBrush(ok)
+            _poly(p, [(cx - 4, track.bottom() + 6.0), (cx + 4, track.bottom() + 6.0), (cx, track.bottom() + 1.5)])
+
+        # alça
+        hot = self._drag_x is not None or (self._hover_x is not None and abs(self._hover_x - px) < 12.0)
+        radius = 8.0 if hot else 6.5
+        center = QPointF(px, track.center().y())
+        p.setPen(Qt.NoPen)
+        for scale, alpha in ((2.2, 26), (1.6, 44)):
+            p.setBrush(QColor(0, 212, 255, alpha + (20 if hot else 0)))
+            p.drawEllipse(center, radius * scale, radius * scale)
+        knob = QLinearGradient(center.x(), center.y() - radius, center.x(), center.y() + radius)
+        knob.setColorAt(0.0, QColor("#ffffff"))
+        knob.setColorAt(1.0, QColor("#9fb0c4"))
+        p.setPen(QPen(QColor("#00d4ff"), 1.8))
+        p.setBrush(QBrush(knob))
+        p.drawEllipse(center, radius, radius)
+
+        # balão de tempo (hover ou arraste)
+        bubble_x = self._drag_x if self._drag_x is not None else self._hover_x
+        if bubble_x is not None:
+            label = format_clock(self._seconds_of(bubble_x))
+            font = p.font()
+            font.setPointSizeF(8.0)
+            font.setBold(True)
+            p.setFont(font)
+            width = p.fontMetrics().horizontalAdvance(label) + 14.0
+            left = max(2.0, min(self.width() - width - 2.0, bubble_x - width / 2.0))
+            box = QRectF(left, 1.0, width, 16.0)
+            p.setPen(QPen(QColor(0, 180, 220, 130), 1.0))
+            p.setBrush(QColor("#0b0f1e"))
+            p.drawRoundedRect(box, 6, 6)
+            p.setPen(QColor("#e8f4ff"))
+            p.drawText(box, Qt.AlignCenter, label)
+        p.end()
 
 
 # ----------------------------------------------------------------------------
@@ -2738,27 +3190,30 @@ class FaderSlider(QSlider):
         cap = self._cap_rect()
         cap_c = self._pos_of(self.value())
 
-        # escala graduada (só nos faders verticais, fora da largura do knob)
         if vertical:
-            for i in range(11):
-                pos = a + (b - a) * i / 10.0
-                major = i % 5 == 0
-                length = 7.0 if major else 4.0
-                p.setPen(QPen(QColor(140, 180, 220, 150 if major else 78), 1.0))
-                xl = cx - self._cap_short / 2.0 - 3.0
-                xr = cx + self._cap_short / 2.0 + 3.0
-                p.drawLine(QPointF(xl - length, pos), QPointF(xl, pos))
-                p.drawLine(QPointF(xr, pos), QPointF(xr + length, pos))
+            self._paint_scale(p, cx, a, b, cap_c, enabled)
 
-        # ranhura rebaixada (sombra interna + brilho na borda inferior)
-        p.setPen(QPen(QColor(255, 255, 255, 18), 1.0))
+        # moldura metálica da ranhura (placa do fader)
+        bezel = slot.adjusted(-4.5, -4.5, 4.5, 4.5)
+        plate = QLinearGradient(bezel.topLeft(), bezel.topRight() if vertical else bezel.bottomLeft())
+        plate.setColorAt(0.0, QColor("#3a4556"))
+        plate.setColorAt(0.45, QColor("#1c2330"))
+        plate.setColorAt(1.0, QColor("#0d121a"))
+        p.setPen(QPen(QColor("#04070c"), 1.0))
+        p.setBrush(QBrush(plate))
+        p.drawRoundedRect(bezel, bezel.width() / 2.0 if vertical else bezel.height() / 2.0,
+                          bezel.width() / 2.0 if vertical else bezel.height() / 2.0)
+        p.setPen(QPen(QColor(255, 255, 255, 34), 1.0))
         p.setBrush(Qt.NoBrush)
-        p.drawRoundedRect(slot.adjusted(-0.6, -0.6, 0.6, 1.2), thick / 2.0, thick / 2.0)
+        p.drawRoundedRect(bezel.adjusted(1.0, 1.0, -1.0, -1.0), bezel.width() / 2.0 - 1.0 if vertical else bezel.height() / 2.0 - 1.0,
+                          bezel.width() / 2.0 - 1.0 if vertical else bezel.height() / 2.0 - 1.0)
+
+        # ranhura rebaixada
         groove = QLinearGradient(slot.topLeft(), slot.topRight() if vertical else slot.bottomLeft())
         groove.setColorAt(0.0, QColor("#010204"))
-        groove.setColorAt(0.5, QColor("#070b12"))
-        groove.setColorAt(1.0, QColor("#0e1521"))
-        p.setPen(QPen(QColor("#04070c"), 1.0))
+        groove.setColorAt(0.5, QColor("#05080d"))
+        groove.setColorAt(1.0, QColor("#0b111a"))
+        p.setPen(QPen(QColor("#020305"), 1.0))
         p.setBrush(QBrush(groove))
         p.drawRoundedRect(slot, thick / 2.0, thick / 2.0)
 
@@ -2786,73 +3241,112 @@ class FaderSlider(QSlider):
             p.setBrush(QBrush(fill_grad))
             p.drawRoundedRect(fill, 2, 2)
 
-        # marca do valor padrão
+        # marca do valor padrão (entalhe âmbar na moldura)
         if self._default_raw is not None:
             dpos = self._pos_of(self._default_raw)
             p.setPen(Qt.NoPen)
-            p.setBrush(QColor(251, 191, 36, 210))
+            p.setBrush(QColor(251, 191, 36, 220))
             if vertical:
-                p.drawRect(QRectF(slot.left() - 4.0, dpos - 0.75, 3.0, 1.5))
-                p.drawRect(QRectF(slot.right() + 1.0, dpos - 0.75, 3.0, 1.5))
+                p.drawRect(QRectF(bezel.left() - 3.0, dpos - 0.75, 3.0, 1.5))
+                p.drawRect(QRectF(bezel.right(), dpos - 0.75, 3.0, 1.5))
             else:
-                p.drawRect(QRectF(dpos - 0.75, slot.top() - 4.0, 1.5, 3.0))
-                p.drawRect(QRectF(dpos - 0.75, slot.bottom() + 1.0, 1.5, 3.0))
+                p.drawRect(QRectF(dpos - 0.75, bezel.top() - 3.0, 1.5, 3.0))
+                p.drawRect(QRectF(dpos - 0.75, bezel.bottom(), 1.5, 3.0))
 
         self._paint_cap(p, cap, vertical, enabled)
         p.end()
 
+    def _paint_scale(self, p: QPainter, cx: float, a: float, b: float, cap_c: float, enabled: bool) -> None:
+        """Escala graduada à esquerda e coluna de LEDs segmentados à direita (fora da largura do knob)."""
+        xl = cx - self._cap_short / 2.0 - 3.0
+        for i in range(11):
+            pos = a + (b - a) * i / 10.0
+            major = i % 5 == 0
+            length = 8.0 if major else 4.0
+            p.setPen(QPen(QColor(150, 190, 230, 165 if major else 80), 1.0))
+            p.drawLine(QPointF(xl - length, pos), QPointF(xl, pos))
+        segments = 18
+        seg_h = (a - b) / segments
+        lx = cx + self._cap_short / 2.0 + 4.0
+        p.setPen(Qt.NoPen)
+        for i in range(segments):
+            bottom = a - i * seg_h
+            seg = QRectF(lx, bottom - seg_h + 1.0, 4.0, seg_h - 2.0)
+            frac = (i + 0.5) / segments
+            lit = enabled and cap_c <= bottom - seg_h / 2.0
+            if lit:
+                color = QColor("#22d3ee" if frac < 0.62 else "#67e8f9" if frac < 0.80 else "#fbbf24" if frac < 0.92 else "#f97316")
+                halo = QColor(color)
+                halo.setAlpha(46)
+                p.setBrush(halo)
+                p.drawRoundedRect(seg.adjusted(-1.5, -1.0, 1.5, 1.0), 2.0, 2.0)
+                p.setBrush(color)
+            else:
+                p.setBrush(QColor(255, 255, 255, 16))
+            p.drawRoundedRect(seg, 1.0, 1.0)
+
     def _paint_cap(self, p: QPainter, r: QRectF, vertical: bool, enabled: bool) -> None:
         pressed = self._grab is not None
-        # sombra projetada em camadas
+        # sombra projetada em camadas (o knob "afunda" quando pressionado)
+        drop = 1.5 if pressed else 3.5
         p.setPen(Qt.NoPen)
-        for grow, alpha in ((5.0, 24), (3.0, 34), (1.5, 52)):
+        for grow, alpha in ((6.0, 22), (3.5, 34), (1.5, 56)):
             p.setBrush(QColor(0, 0, 0, alpha))
-            p.drawRoundedRect(r.adjusted(-grow, -grow + 3.0, grow, grow + 3.0), 5.0 + grow, 5.0 + grow)
-        # corpo metálico (luz vindo de cima)
+            p.drawRoundedRect(r.adjusted(-grow, -grow + drop, grow, grow + drop), 5.0 + grow, 5.0 + grow)
+        # corpo metálico escovado (luz vindo de cima)
         body = QLinearGradient(r.topLeft(), r.bottomLeft())
         if enabled:
-            for stop, color in ((0.00, "#f4f7fb"), (0.10, "#d6dde7"), (0.46, "#9ba6b5"),
-                                (0.52, "#76818f"), (0.58, "#8995a4"), (1.00, "#444d5a")):
+            for stop, color in ((0.00, "#f7f9fc"), (0.08, "#dbe2ec"), (0.30, "#aab5c4"),
+                                (0.50, "#7d8998"), (0.56, "#8d99a8"), (1.00, "#3c4552")):
                 body.setColorAt(stop, QColor(color))
         else:
             for stop, color in ((0.0, "#5b6470"), (0.5, "#3b434e"), (1.0, "#262c35")):
                 body.setColorAt(stop, QColor(color))
-        p.setPen(QPen(QColor("#0b0f15"), 1.0))
+        p.setPen(QPen(QColor("#080b10"), 1.0))
         p.setBrush(QBrush(body))
-        p.drawRoundedRect(r, 4.0, 4.0)
-        # bisel interno
-        p.setPen(QPen(QColor(255, 255, 255, 95), 1.0))
+        p.drawRoundedRect(r, 5.0, 5.0)
+        # chanfro: luz no alto/esquerda, sombra embaixo
         p.setBrush(Qt.NoBrush)
-        p.drawRoundedRect(r.adjusted(1.0, 1.0, -1.0, -1.0), 3.0, 3.0)
-        if (self._hover or pressed) and enabled:
-            p.setPen(Qt.NoPen)
-            p.setBrush(QColor(255, 255, 255, 26 if pressed else 16))
-            p.drawRoundedRect(r.adjusted(1.0, 1.0, -1.0, -1.0), 3.0, 3.0)
-        # estrias perpendiculares ao curso
+        p.setPen(QPen(QColor(255, 255, 255, 120), 1.0))
+        p.drawRoundedRect(r.adjusted(1.0, 1.0, -1.0, -1.0), 4.0, 4.0)
+        p.setPen(QPen(QColor(0, 0, 0, 70), 1.0))
+        p.drawLine(QPointF(r.left() + 3.0, r.bottom() - 1.5), QPointF(r.right() - 3.0, r.bottom() - 1.5))
+        # almofada de pegada côncava (borracha escura) com estrias
+        pad = r.adjusted(5.0, 4.5, -5.0, -4.5) if vertical else r.adjusted(4.5, 5.0, -4.5, -5.0)
+        grip = QLinearGradient(pad.topLeft(), pad.bottomLeft() if vertical else pad.topRight())
+        for stop, color in ((0.0, "#262d38"), (0.5, "#0a0d13"), (1.0, "#262d38")):
+            grip.setColorAt(stop, QColor(color))
+        p.setPen(QPen(QColor(0, 0, 0, 170), 1.0))
+        p.setBrush(QBrush(grip))
+        p.drawRoundedRect(pad, 3.0, 3.0)
         center = r.center()
-        for k in (-0.27, -0.16, 0.16, 0.27):
+        for k in (-0.30, -0.19, 0.19, 0.30):
             off = k * self._cap_long
             if vertical:
                 y = center.y() + off
-                dark = (QPointF(r.left() + 5.0, y), QPointF(r.right() - 5.0, y))
-                light = (QPointF(r.left() + 5.0, y + 1.0), QPointF(r.right() - 5.0, y + 1.0))
+                line_a = (QPointF(pad.left() + 3.0, y), QPointF(pad.right() - 3.0, y))
+                line_b = (QPointF(pad.left() + 3.0, y + 1.0), QPointF(pad.right() - 3.0, y + 1.0))
             else:
                 x = center.x() + off
-                dark = (QPointF(x, r.top() + 5.0), QPointF(x, r.bottom() - 5.0))
-                light = (QPointF(x + 1.0, r.top() + 5.0), QPointF(x + 1.0, r.bottom() - 5.0))
-            p.setPen(QPen(QColor(0, 0, 0, 105), 1.0))
-            p.drawLine(*dark)
-            p.setPen(QPen(QColor(255, 255, 255, 70), 1.0))
-            p.drawLine(*light)
-        # linha indicadora central
+                line_a = (QPointF(x, pad.top() + 3.0), QPointF(x, pad.bottom() - 3.0))
+                line_b = (QPointF(x + 1.0, pad.top() + 3.0), QPointF(x + 1.0, pad.bottom() - 3.0))
+            p.setPen(QPen(QColor(0, 0, 0, 150), 1.0))
+            p.drawLine(*line_a)
+            p.setPen(QPen(QColor(255, 255, 255, 34), 1.0))
+            p.drawLine(*line_b)
+        if (self._hover or pressed) and enabled:
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(255, 255, 255, 26 if pressed else 14))
+            p.drawRoundedRect(r.adjusted(1.0, 1.0, -1.0, -1.0), 4.0, 4.0)
+        # linha indicadora central, atravessando o knob
         if vertical:
-            line = (QPointF(r.left() + 4.0, center.y()), QPointF(r.right() - 4.0, center.y()))
+            line = (QPointF(r.left() + 2.5, center.y()), QPointF(r.right() - 2.5, center.y()))
         else:
-            line = (QPointF(center.x(), r.top() + 4.0), QPointF(center.x(), r.bottom() - 4.0))
+            line = (QPointF(center.x(), r.top() + 2.5), QPointF(center.x(), r.bottom() - 2.5))
         if enabled:
-            p.setPen(QPen(QColor(251, 191, 36, 150 if pressed else 85), 4.5, Qt.SolidLine, Qt.RoundCap))
+            p.setPen(QPen(QColor(251, 191, 36, 150 if pressed else 80), 4.5, Qt.SolidLine, Qt.RoundCap))
             p.drawLine(*line)
-            p.setPen(QPen(QColor("#ffd26d"), 1.7, Qt.SolidLine, Qt.RoundCap))
+            p.setPen(QPen(QColor("#fff3c4"), 1.7, Qt.SolidLine, Qt.RoundCap))
         else:
             p.setPen(QPen(QColor(120, 128, 140), 1.7, Qt.SolidLine, Qt.RoundCap))
         p.drawLine(*line)
@@ -3132,7 +3626,11 @@ SHORTCUTS_TEXT = (
     "Espaço\tReproduzir / pausar\n"
     "Ctrl+.\tParar\n"
     "Ctrl+←  /  Ctrl+→\tVoltar / avançar 10 s\n"
-    "Clique na linha do tempo\tIr para o ponto (durante a reprodução)\n"
+    "Clique na partitura ou na barra do player\tIr para o ponto (parado: define o início)\n"
+    "Alt+←  /  Alt+→\tMarcador (transição/drop) anterior / próximo\n"
+    "Setas ← →  (partitura em foco)\tRolar a partitura\n"
+    "Duplo clique na partitura\tAproximar / ajustar à janela\n"
+    "Arrastar a janela do minimapa\tNavegar; as bordas dão zoom\n"
     "Roda do mouse na partitura\tZoom no ponto sob o cursor\n"
     "Shift+roda  /  botão do meio\tRolar a partitura\n"
     "Ctrl+=  /  Ctrl+-  /  Ctrl+0\tAproximar / afastar / ajustar à janela\n"
@@ -3160,6 +3658,7 @@ class VisionAudioWindow(QMainWindow):
         self.current_sequence: Optional[GeneratedSequence] = None
         self.current_recommendation: Optional[RecommendationResult] = None
         self._ui_busy = False
+        self._cue_s = 0.0           # onde a reprodução começa quando está parada
         self._last_background_error = False
         self._last_dir = ""
         self._editors: Dict[str, Any] = {}
@@ -3212,6 +3711,8 @@ class VisionAudioWindow(QMainWindow):
         self.act_stop = self._action("Parar", self.stop_playback, "Ctrl+.")
         self.act_back = self._action(f"Voltar {SEEK_STEP_S} s", lambda: self.seek_by(-SEEK_STEP_S), "Ctrl+Left")
         self.act_forward = self._action(f"Avançar {SEEK_STEP_S} s", lambda: self.seek_by(SEEK_STEP_S), "Ctrl+Right")
+        self.act_prev_marker = self._action("Marcador anterior", lambda: self._jump_marker(-1), "Alt+Left")
+        self.act_next_marker = self._action("Próximo marcador", lambda: self._jump_marker(1), "Alt+Right")
         self.act_zoom_in = self._action("Aproximar a partitura", lambda: self.timeline.zoom_in(), "Ctrl+=")
         self.act_zoom_out = self._action("Afastar a partitura", lambda: self.timeline.zoom_out(), "Ctrl+-")
         self.act_zoom_fit = self._action("Ajustar partitura à janela", lambda: self.timeline.zoom_fit(), "Ctrl+0")
@@ -3221,7 +3722,8 @@ class VisionAudioWindow(QMainWindow):
         self.act_shortcuts = self._action("Atalhos de teclado", self.show_shortcuts)
         self.act_about = self._action("Sobre", self.show_about)
         for action in (self.act_open, self.act_load, self.act_generate, self.act_play, self.act_stop,
-                       self.act_back, self.act_forward, self.act_zoom_in, self.act_zoom_out, self.act_zoom_fit):
+                       self.act_back, self.act_forward, self.act_zoom_in, self.act_zoom_out, self.act_zoom_fit,
+                       self.act_prev_marker, self.act_next_marker):
             self.addAction(action)       # atalhos valem mesmo com os menus escondidos
 
     def _build_menus(self) -> None:
@@ -3240,6 +3742,9 @@ class VisionAudioWindow(QMainWindow):
         param_menu.addAction(self.act_reset_all)
 
         self.view_menu = bar.addMenu("&Ver")
+        for action in (self.act_prev_marker, self.act_next_marker):
+            self.view_menu.addAction(action)
+        self.view_menu.addSeparator()
         for action in (self.act_zoom_in, self.act_zoom_out, self.act_zoom_fit):
             self.view_menu.addAction(action)
         self.view_menu.addSeparator()
@@ -3346,6 +3851,33 @@ class VisionAudioWindow(QMainWindow):
             head.addWidget(chip, 0, Qt.AlignVCenter)
         layout.addLayout(head)
 
+        tools = QHBoxLayout()
+        tools.setSpacing(4)
+        self.prev_marker_button = self._tool_button("prev_marker", "Marcador anterior (Alt+←)", size=16)
+        self.next_marker_button = self._tool_button("next_marker", "Próximo marcador (Alt+→)", size=16)
+        marker_label = QLabel("Marcadores")
+        marker_label.setProperty("role", "faint")
+        tools.addWidget(self.prev_marker_button)
+        tools.addWidget(self.next_marker_button)
+        tools.addWidget(marker_label)
+        tools.addStretch(1)
+        self.zoom_out_button = self._tool_button("zoom_out", "Afastar (Ctrl+-)", size=16)
+        self.zoom_label = QLabel("1×")
+        self.zoom_label.setProperty("role", "muted")
+        self.zoom_label.setAlignment(Qt.AlignCenter)
+        self.zoom_label.setMinimumWidth(46)
+        self.zoom_in_button = self._tool_button("zoom_in", "Aproximar (Ctrl+=)", size=16)
+        self.zoom_fit_button = self._tool_button("fit", "Ajustar à janela (Ctrl+0 · duplo clique)", size=16)
+        self.follow_button = self._tool_button("follow", "Seguir o cursor durante a reprodução", size=16)
+        self.follow_button.setCheckable(True)
+        self.follow_button.setChecked(True)
+        for widget in (self.zoom_out_button, self.zoom_label, self.zoom_in_button, self.zoom_fit_button, self.follow_button):
+            tools.addWidget(widget)
+        for button in (self.prev_marker_button, self.next_marker_button, self.zoom_out_button,
+                       self.zoom_in_button, self.zoom_fit_button, self.follow_button):
+            button.setFixedSize(30, 26)
+        layout.addLayout(tools)
+
         self.timeline = TimelineWidget()
         layout.addWidget(self.timeline, 1)
         return panel
@@ -3425,16 +3957,30 @@ class VisionAudioWindow(QMainWindow):
     def _build_transport_bar(self) -> QFrame:
         bar = QFrame()
         bar.setObjectName("TransportBar")
-        row = QHBoxLayout(bar)
-        row.setContentsMargins(12, 8, 12, 8)
-        row.setSpacing(6)
+        outer = QVBoxLayout(bar)
+        outer.setContentsMargins(14, 8, 14, 10)
+        outer.setSpacing(4)
+        self.seek_bar = SeekBar()
+        outer.addWidget(self.seek_bar)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        outer.addLayout(row)
 
         self.seek_back_button = self._tool_button("back", f"Voltar {SEEK_STEP_S} s (Ctrl+←)")
-        self.play_button = self._tool_button("play", "Reproduzir / pausar (Espaço)", role="play", size=18)
-        self.play_button.setFixedSize(36, 36)
+        self.play_button = self._tool_button("play", "Reproduzir / pausar (Espaço)", role="play", size=22)
+        self.play_button.setFixedSize(46, 46)
         self.play_button.setIcon(IconFactory.icon("play", "#1a1305"))   # contraste sobre o fundo âmbar
         self.stop_button = self._tool_button("stop", "Parar (Ctrl+.)")
         self.seek_forward_button = self._tool_button("forward", f"Avançar {SEEK_STEP_S} s (Ctrl+→)")
+        for button in (self.seek_back_button, self.stop_button, self.seek_forward_button):
+            button.setProperty("role", "transport")
+            button.setFixedSize(34, 34)
+        glow = QGraphicsDropShadowEffect(self.play_button)
+        glow.setBlurRadius(24)
+        glow.setOffset(0, 0)
+        glow.setColor(QColor(245, 158, 11, 150))
+        self.play_button.setGraphicsEffect(glow)
         for button in (self.seek_back_button, self.play_button, self.stop_button, self.seek_forward_button):
             row.addWidget(button)
 
@@ -3444,7 +3990,8 @@ class VisionAudioWindow(QMainWindow):
         self.time_label.setContentsMargins(12, 0, 8, 0)
         row.addWidget(self.time_label)
         self.state_label = QLabel(PLAYER_STATE_LABELS["idle"])
-        self.state_label.setProperty("role", "muted")
+        self.state_label.setObjectName("PlayerState")
+        self.state_label.setProperty("state", "idle")
         row.addWidget(self.state_label)
         row.addStretch(1)
 
@@ -3620,12 +4167,21 @@ class VisionAudioWindow(QMainWindow):
         self.connect_button.clicked.connect(self.toggle_connection)
 
         self.timeline.seek_requested.connect(self._on_timeline_seek)
+        self.seek_bar.seek_requested.connect(self._on_timeline_seek)
+        self.timeline.view_changed.connect(self._on_timeline_view)
+        self.timeline.follow_changed.connect(self._on_follow_changed)
+        self.prev_marker_button.clicked.connect(lambda _checked=False: self._jump_marker(-1))
+        self.next_marker_button.clicked.connect(lambda _checked=False: self._jump_marker(1))
+        self.zoom_in_button.clicked.connect(lambda _checked=False: self.timeline.zoom_in())
+        self.zoom_out_button.clicked.connect(lambda _checked=False: self.timeline.zoom_out())
+        self.zoom_fit_button.clicked.connect(lambda _checked=False: self.timeline.zoom_fit())
+        self.follow_button.toggled.connect(self.timeline.set_follow)
         self.transition_table.cellDoubleClicked.connect(self._on_transition_activated)
         self.param_panel.group_reset.connect(self.restore_group_defaults)
 
         self.playback_controller.state_changed.connect(self._on_playback_state_changed)
         self.playback_controller.position_changed.connect(self._on_playback_position_changed)
-        self.playback_controller.frame_changed.connect(self.led_monitor.set_levels)
+        self.playback_controller.frame_changed.connect(self._set_live_levels)
         self.playback_controller.playback_finished.connect(self._on_playback_finished)
         self.playback_controller.playback_error.connect(self._on_playback_error)
         self.video_window_controller.state_changed.connect(self._on_video_window_state_changed)
@@ -3694,6 +4250,11 @@ class VisionAudioWindow(QMainWindow):
         self.act_stop.setEnabled(self.stop_button.isEnabled())
         self.act_back.setEnabled(playing)
         self.act_forward.setEnabled(playing)
+        for widget in (self.prev_marker_button, self.next_marker_button, self.zoom_in_button,
+                       self.zoom_out_button, self.zoom_fit_button, self.follow_button,
+                       self.act_prev_marker, self.act_next_marker, self.act_zoom_in,
+                       self.act_zoom_out, self.act_zoom_fit):
+            widget.setEnabled(has_sequence)
 
     def _on_source_mode_changed(self, _index: int = 0) -> None:
         is_local = self.source_combo.currentData() == "local"
@@ -3883,7 +4444,9 @@ class VisionAudioWindow(QMainWindow):
         self.chip_transitions.setText("— transições")
         self.transition_table.setRowCount(0)
         self.timeline.set_sequence(None)
-        self.led_monitor.set_levels([0] * 6)
+        self.seek_bar.set_sequence(None)
+        self._cue_s = 0.0
+        self._set_live_levels([0] * 6)
         self.time_label.setText(f"{format_clock(0)} / {format_clock(track.duration_s)}")
         self._reset_analysis()
         self.log(f"Faixa carregada: {track.title}")
@@ -3913,6 +4476,8 @@ class VisionAudioWindow(QMainWindow):
         self._cleanup_sequence_temp_files(self.current_sequence)
         self.current_sequence = sequence
         self.timeline.set_sequence(sequence)
+        self.seek_bar.set_sequence(sequence)
+        self._cue_s = 0.0
         self._fill_transition_table()
         report = sequence.report or {}
         self.chip_bpm.setText(f"{sequence.tempo_bpm:.1f} BPM")
@@ -3964,9 +4529,12 @@ class VisionAudioWindow(QMainWindow):
         if self.playback_controller.state in ("playing", "paused"):
             self.playback_controller.pause_toggle()
             return
-        self.playback_controller.play(self.current_sequence)
+        self.playback_controller.play(self.current_sequence, self._cue_s)
 
     def stop_playback(self) -> None:
+        if self.playback_controller.state == "idle" and self._cue_s > 0:
+            self._cue_s = 0.0                      # Parar de novo volta ao começo da faixa
+            self._apply_cue_display()
         self.playback_controller.stop()
         self.video_window_controller.close()
 
@@ -3974,35 +4542,95 @@ class VisionAudioWindow(QMainWindow):
         if self.playback_controller.state in ("playing", "paused"):
             self.playback_controller.seek_relative(delta_s)
 
-    def _on_timeline_seek(self, seconds: float) -> None:
+    def _on_timeline_seek(self, seconds: float, reveal: bool = False) -> None:
         sequence = self.current_sequence
         if not sequence or sequence.duration_s <= 0:
             return
-        if self.playback_controller.state not in ("playing", "paused"):
-            self.statusBar().showMessage("Inicie a reprodução (Espaço) para navegar pela linha do tempo.", 4000)
+        seconds = max(0.0, min(float(sequence.duration_s), float(seconds)))
+        if self.playback_controller.state in ("playing", "paused"):
+            self.playback_controller.seek_to(seconds)
+        else:
+            self._cue_s = seconds                  # parado: define de onde a reprodução começa
+            self._apply_cue_display()
+            self.statusBar().showMessage(
+                f"Início em {format_clock(seconds)} — pressione Espaço para tocar a partir daqui.", 4000)
+        if reveal:
+            self.timeline.reveal(seconds)
+
+    def _apply_cue_display(self) -> None:
+        sequence = self.current_sequence
+        duration = sequence.duration_s if sequence else None
+        for widget in (self.timeline, self.seek_bar):
+            widget.set_cue(self._cue_s)
+            widget.set_position(self._cue_s)
+        self.time_label.setText(f"{format_clock(self._cue_s)} / {format_clock(duration)}")
+
+    def _current_position(self) -> float:
+        if self.playback_controller.state in ("playing", "paused"):
+            return self.playback_controller.current_position_s()
+        return self._cue_s
+
+    def _marker_times(self) -> List[float]:
+        sequence = self.current_sequence
+        if not sequence:
+            return []
+        fps = float(sequence.fps)
+        times = [float(getattr(t, "frame_start", 0)) / fps for t in sequence.transitions]
+        times += [float(d) for d in (sequence.report or {}).get("drops_s", [])]
+        return sorted({round(t, 3) for t in times})
+
+    def _jump_marker(self, direction: int) -> None:
+        times = self._marker_times()
+        if not times:
             return
-        self.playback_controller.seek_ratio(seconds / sequence.duration_s)
+        now = self._current_position()
+        if direction > 0:
+            target = next((t for t in times if t > now + 0.30), None)
+        else:
+            target = next((t for t in reversed(times) if t < now - 0.60), None)
+            if target is None and now > 0.05:
+                target = 0.0
+        if target is None:
+            self.statusBar().showMessage("Não há mais marcadores nessa direção.", 2500)
+            return
+        self._on_timeline_seek(target, reveal=True)
+
+    def _on_timeline_view(self, _start: float, span: float, duration: float) -> None:
+        zoom = duration / span if span > 0 and duration > 0 else 1.0
+        self.zoom_label.setText("1×" if zoom < 1.05 else f"{zoom:.1f}×")
+
+    def _on_follow_changed(self, flag: bool) -> None:
+        self.follow_button.blockSignals(True)
+        self.follow_button.setChecked(flag)
+        self.follow_button.blockSignals(False)
+
+    def _set_live_levels(self, levels: Sequence[int]) -> None:
+        self.led_monitor.set_levels(levels)
+        self.timeline.set_live_levels(levels)
 
     def _on_transition_activated(self, row: int, _column: int) -> None:
         sequence = self.current_sequence
         if sequence and 0 <= row < len(sequence.transitions):
             start = float(getattr(sequence.transitions[row], "frame_start", 0)) / sequence.fps
-            self._on_timeline_seek(start)
+            self._on_timeline_seek(start, reveal=True)
 
     def _on_playback_state_changed(self, state: str) -> None:
         self.state_label.setText(PLAYER_STATE_LABELS.get(state, state))
+        self.state_label.setProperty("state", state)
+        refresh_style(self.state_label)
         self.play_button.setIcon(IconFactory.icon("pause" if state == "playing" else "play",
                                                   "#1a1305"))
         if state == "idle":
-            self.timeline.set_position(0.0)
-            self.led_monitor.set_levels([0] * 6)
-            duration = self.current_sequence.duration_s if self.current_sequence else None
-            self.time_label.setText(f"{format_clock(0)} / {format_clock(duration)}")
+            self._set_live_levels([0] * 6)
+            self._apply_cue_display()
         self._update_controls_enabled()
 
     def _on_playback_position_changed(self, elapsed: float, duration: float) -> None:
+        if self.playback_controller.state == "idle":
+            elapsed = self._cue_s                  # parado: o cursor fica no ponto de início
         self.time_label.setText(f"{format_clock(elapsed)} / {format_clock(duration)}")
         self.timeline.set_position(elapsed)
+        self.seek_bar.set_position(elapsed)
 
     def _on_playback_finished(self) -> None:
         self.log("Reprodução finalizada.")
