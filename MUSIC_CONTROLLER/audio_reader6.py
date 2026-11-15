@@ -1,270 +1,39 @@
+"""Motor de partitura de LEDs (audio_reader6).
+
+Transforma um áudio numa partitura de PWM para 6 LEDs (2 pontas + 4 do meio),
+totalmente offline:
+
+  * pontas  — kick/graves (gate + envelope), inalteradas desde a v6;
+  * meio    — sequências ancoradas no grid de batidas e guiadas pela música
+              (ataques por banda, compasso, seções, drops);
+  * transições — efeitos nas viradas de seção, refinados e alinhados ao compasso.
+
+Uso (a interface é `visionaudio7_3.py`):
+
+    engine = LedScoreEngine(fps=30, config=EffectConfig())
+    result = engine.compute_score(y, sr, progress_cb=lambda frac, label: ...)
+
+Também expõe o acesso a áudio remoto (YouTube) sem HTTP 403:
+`resolve_youtube_stream_info`, `load_remote_audio`, `make_playback_wav`.
+"""
+
 from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field
 from enum import Enum, auto
+import glob
+import math
 import os
-import signal
+import random
 import shutil
 import subprocess
-import sys
 import tempfile
-import time
 from typing import Optional
-import wave
+import urllib.error
+import urllib.request
 
 import librosa
 import numpy as np
-import pygame
-import serial
-
-
-# ---------------------------------------------------------------------------
-# Terminal helpers
-# ---------------------------------------------------------------------------
-
-class C:
-    RESET    = "\033[0m";  BOLD     = "\033[1m";  DIM      = "\033[2m"
-    RED      = "\033[31m"; GREEN    = "\033[32m"; YELLOW   = "\033[33m"
-    BLUE     = "\033[34m"; MAGENTA  = "\033[35m"; CYAN     = "\033[36m"
-    BRED     = "\033[91m"; BGREEN   = "\033[92m"; BYELLOW  = "\033[93m"
-    BBLUE    = "\033[94m"; BMAGENTA = "\033[95m"; BCYAN    = "\033[96m"
-    BWHITE   = "\033[97m"
-
-
-def _c(text, *codes):
-    return "".join(codes) + str(text) + C.RESET
-
-
-def banner():
-    lines = [
-        "  ██╗     ███████╗██████╗     ███████╗██╗   ██╗███╗   ██╗ ██████╗ ",
-        "  ██║     ██╔════╝██╔══██╗    ██╔════╝╚██╗ ██╔╝████╗  ██║██╔════╝ ",
-        "  ██║     █████╗  ██║  ██║    ███████╗ ╚████╔╝ ██╔██╗ ██║██║      ",
-        "  ██║     ██╔══╝  ██║  ██║    ╚════██║  ╚██╔╝  ██║╚██╗██║██║      ",
-        "  ███████╗███████╗██████╔╝    ███████║   ██║   ██║ ╚████║╚██████╗ ",
-        "  ╚══════╝╚══════╝╚═════╝     ╚══════╝   ╚═╝   ╚═╝  ╚═══╝ ╚═════╝ ",
-    ]
-    width = len(lines[0])
-    sep = _c("─" * (width + 4), C.DIM, C.CYAN)
-    print()
-    print(sep)
-    for line in lines:
-        print(_c("  " + line, C.BMAGENTA, C.BOLD))
-    print(_c("  " + " " * 22 + "🎵  Music → LED  🎵", C.BYELLOW, C.BOLD))
-    print(sep)
-    print()
-
-
-def log_ok(msg):   print(_c("  ✓ ", C.BGREEN,   C.BOLD) + _c(msg, C.BWHITE))
-def log_err(msg):  print(_c("  ✗ ", C.BRED,     C.BOLD) + _c(msg, C.BWHITE))
-def log_warn(msg): print(_c("  ⚠  ", C.BYELLOW, C.BOLD) + _c(msg, C.BWHITE))
-def log_step(msg): print(_c("\n  ▶ ", C.BBLUE,  C.BOLD) + _c(msg, C.BWHITE, C.BOLD))
-def log_sub(msg):  print(_c("    │ ", C.DIM, C.BLUE) + _c(msg, C.BWHITE))
-
-
-def section_line():
-    print(_c("  " + "─" * 64, C.DIM, C.CYAN))
-
-
-def progress_bar(current, total, width=30, label=""):
-    pct    = current / max(total, 1)
-    filled = int(pct * width)
-    bar    = _c("█" * filled, C.BMAGENTA) + _c("░" * (width - filled), C.DIM)
-    pct_s  = _c(f"{pct*100:5.1f}%", C.BYELLOW, C.BOLD)
-    print(f"    │ {bar} {pct_s}  {_c(label, C.DIM)}", end="\r")
-
-
-SEEK_STEP_S = 10
-_QT_ENV_CONFIGURED = False
-
-
-class KeyReader:
-    """Leitura de teclas sem bloqueio; reconhece setas (sequências de escape)."""
-
-    def __init__(self):
-        self.enabled = False
-        self._is_win = os.name == "nt"
-        self._fd: Optional[int] = None
-        self._old_attrs = None
-
-    def __enter__(self):
-        if not sys.stdin.isatty():
-            return self
-        if self._is_win:
-            try:
-                import msvcrt  # noqa: F401
-                self.enabled = True
-            except Exception:
-                pass
-            return self
-        try:
-            import termios
-
-            self._fd = sys.stdin.fileno()
-            self._old_attrs = termios.tcgetattr(self._fd)
-            attrs = termios.tcgetattr(self._fd)
-            attrs[3] &= ~(termios.ICANON | termios.ECHO)
-            attrs[6][termios.VMIN] = 0
-            attrs[6][termios.VTIME] = 0
-            termios.tcsetattr(self._fd, termios.TCSADRAIN, attrs)
-            self.enabled = True
-        except Exception:
-            pass
-        return self
-
-    def __exit__(self, *_):
-        if self._is_win or self._fd is None or self._old_attrs is None:
-            return
-        try:
-            import termios
-
-            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old_attrs)
-        except Exception:
-            pass
-
-    def read_key(self) -> Optional[str]:
-        if not self.enabled:
-            return None
-
-        if self._is_win:
-            import msvcrt
-
-            if not msvcrt.kbhit():
-                return None
-            ch = msvcrt.getwch()
-            if ch in ("\x00", "\xe0"):
-                ch2 = msvcrt.getwch()
-                return {"K": "LEFT", "M": "RIGHT", "H": "UP", "P": "DOWN"}.get(ch2)
-            return ch
-
-        import select
-
-        if self._fd is None:
-            return None
-        ready, _, _ = select.select([sys.stdin], [], [], 0)
-        if not ready:
-            return None
-        try:
-            ch = os.read(self._fd, 1).decode("utf-8", errors="ignore")
-        except Exception:
-            return None
-
-        if ch == "\x1b":
-            r2, _, _ = select.select([sys.stdin], [], [], 0.04)
-            if r2:
-                try:
-                    rest = os.read(self._fd, 4).decode("utf-8", errors="ignore")
-                    if rest.startswith("["):
-                        return {
-                            "A": "UP",
-                            "B": "DOWN",
-                            "C": "RIGHT",
-                            "D": "LEFT",
-                        }.get(rest[1:2], "ESC")
-                except Exception:
-                    pass
-            return "ESC"
-        return ch
-
-
-def _fit_text(text: str, width: int) -> str:
-    s = str(text).replace("\n", " ")
-    if width <= 0:
-        return ""
-    if len(s) > width:
-        return s[: width - 3] + "..." if width > 3 else s[:width]
-    return s.ljust(width)
-
-
-def _fmt_dur(s: Optional[float]) -> str:
-    if s is None:
-        return "--:--"
-    m, sec = divmod(int(max(0, s)), 60)
-    h, m = divmod(m, 60)
-    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
-
-
-class PlaybackBox:
-    """HUD de reprodução no mesmo estilo do youtube_player."""
-
-    def __init__(
-        self,
-        title: str,
-        player_name: str,
-        duration_s: Optional[float],
-        queue_idx: int = 0,
-        queue_total: int = 1,
-    ):
-        self.title = title
-        self.player_name = player_name
-        self.duration_s = duration_s
-        self.queue_idx = queue_idx
-        self.queue_total = queue_total
-        self.enabled = sys.stdout.isatty()
-        self._line_count = 0
-
-    def _progress_bar(self, elapsed: float, inner: int, frame_idx: int) -> str:
-        el_str = _fmt_dur(elapsed)
-        tot_str = _fmt_dur(self.duration_s)
-        prefix = f" {el_str} "
-        suffix = f" {tot_str}"
-        space = max(6, inner - len(prefix) - len(suffix) - 4)
-        if self.duration_s and self.duration_s > 0:
-            ratio = min(1.0, max(0.0, elapsed / self.duration_s))
-            filled = int(space * ratio)
-            bar = "▓" * filled + "░" * (space - filled)
-        else:
-            cur = frame_idx % space
-            bar = "".join("▓" if i == cur else "░" for i in range(space))
-        return f"{prefix}[{bar}]{suffix}"
-
-    def draw(
-        self,
-        *,
-        state: str,
-        frame_idx: int,
-        elapsed_s: float,
-        paused: bool,
-        supports_seek: bool = True,
-    ):
-        if not self.enabled:
-            return
-
-        cols = shutil.get_terminal_size((92, 20)).columns
-        width = min(max(cols, 72), 132)
-        inner = width - 2
-
-        ctrl_parts = ["p/⎵ pause"]
-        if supports_seek:
-            ctrl_parts.append("[ ] seek±10s")
-            ctrl_parts.append("←/→ seek±10s")
-        ctrl_parts.append("q sair")
-        ctrl_hint = "  |  ".join(ctrl_parts) + f"  —  {self.player_name}"
-
-        state_color = C.BGREEN if state == "TOCANDO" else C.BYELLOW
-        queue_str = f"[{self.queue_idx + 1}/{self.queue_total}]"
-
-        sep = _c("+" + "─" * inner + "+", C.BCYAN, C.BOLD)
-        out = [
-            sep,
-            _c("|" + _fit_text(f"  {state}  {queue_str}", inner) + "|", state_color, C.BOLD),
-            _c("|" + _fit_text(f"  Faixa: {self.title}", inner) + "|", C.BWHITE),
-            _c(
-                "|" + _fit_text(
-                    f"  Progresso: {self._progress_bar(elapsed_s, inner, frame_idx)}",
-                    inner,
-                ) + "|",
-                C.BCYAN,
-            ),
-            _c("|" + _fit_text(f"  {ctrl_hint}", inner) + "|", C.DIM),
-            sep,
-        ]
-
-        if self._line_count:
-            sys.stdout.write(f"\033[{self._line_count}F")
-        for line in out:
-            sys.stdout.write("\r\033[2K" + line + "\n")
-        sys.stdout.flush()
-        self._line_count = len(out)
+from scipy import ndimage as ndi
 
 
 # ---------------------------------------------------------------------------
@@ -285,23 +54,6 @@ class TransitionEffectType(Enum):
     WAVE          = auto()   # onda senoidal correndo      – groove contínuo
     ALTERNATE     = auto()   # pares alternando            – batida marcada
     RIPPLE        = auto()   # pulso centro→bordas         – transição musical
-
-
-_EFFECT_ICONS = {
-    TransitionEffectType.SWEEP:         ("→→→", C.BBLUE),
-    TransitionEffectType.REVERSE_SWEEP: ("←←←", C.BCYAN),
-    TransitionEffectType.STROBE:        ("◆◆◆", C.BRED),
-    TransitionEffectType.CASCADE:       ("◈◈◈", C.BYELLOW),
-    TransitionEffectType.GLITCH:        ("▒▒▒", C.BMAGENTA),
-    TransitionEffectType.BREATHE:       ("~~~", C.BGREEN),
-    TransitionEffectType.PING_PONG:     ("↔↔↔", C.BCYAN),
-    TransitionEffectType.SPLIT:         ("◄►◄", C.BYELLOW),
-    TransitionEffectType.SPARKLE:       ("✦✦✦", C.BWHITE),
-    TransitionEffectType.BURST:         ("❋❋❋", C.BRED),
-    TransitionEffectType.WAVE:          ("≈≈≈", C.BCYAN),
-    TransitionEffectType.ALTERNATE:     ("╳╳╳", C.BMAGENTA),
-    TransitionEffectType.RIPPLE:        ("◍◍◍", C.BGREEN),
-}
 
 
 # ---------------------------------------------------------------------------
@@ -366,10 +118,6 @@ class EffectConfig:
     # FIX #10: era 0.68 → a 30fps: 0.68^5 = 14% — pontas somem em ~5 frames no idle.
     EDGE_IDLE_DECAY: float = 0.78
 
-    RMS_FAST_ALPHA: float = 0.30
-    RMS_SLOW_ALPHA: float = 0.06
-    FLUX_FAST_ALPHA: float = 0.35
-    FLUX_SLOW_ALPHA: float = 0.07
 
     STARTUP_RAMP_SECONDS: float = 2.0
 
@@ -424,8 +172,45 @@ class EffectConfig:
     # Correção leve e contínua para manter troca de sequência no tempo.
     BPM_CONTINUOUS_SYNC_STRENGTH: float = 0.06
 
-    # FIX #7: frames de lag acumulado antes de pular um frame visual.
-    PLAYBACK_MAX_DRIFT_FRAMES: int = 2
+    # ------------------------------------------------------------------ #
+    # LEDs do meio: sequências guiadas pela música                         #
+    # ------------------------------------------------------------------ #
+
+    # Sensibilidade dos ataques (0..1 sobre o fluxo espectral normalizado
+    # localmente). Menor = mais ataques detectados; maior = só os fortes.
+    MID_HIT_THRESHOLD: float = 0.38
+    # O quanto o brilho de cada passo acompanha o ataque real naquele instante
+    # (0 = todos os passos iguais; 1 = passo sem ataque quase apaga).
+    MID_SUPPORT_DEPTH: float = 0.38
+    # Fração do brilho do passo mantida até o próximo (menor = mais pulsante).
+    MID_STEP_FLOOR: float = 0.78
+    # Trava anti-saturação: média máxima de LEDs do meio acesos ao mesmo tempo.
+    MID_MAX_LIT_AVG: float = 1.8
+    # Duração mínima perceptível de um passo (frames). Evita "borrão".
+    MID_MIN_STEP_FRAMES: float = 4.0
+    # Ajusta passos/batida por compasso conforme a densidade rítmica (com histerese).
+    MID_AUTO_SUBDIVISION: bool = True
+    MID_DENSITY_SPARSE_EPB: float = 0.80
+    MID_DENSITY_DENSE_EPB: float = 3.00
+    # Frase mínima (em compassos) antes de trocar o padrão do sequenciador.
+    MID_MIN_BARS_PER_PATTERN: int = 2
+    # Além de MIDDLE_SEQUENCES, usa ping-pong / fora→dentro / dentro→fora.
+    MID_EXTRA_PATTERNS: bool = False
+    # Drops / buildups (lookahead offline).
+    DROP_DETECT_ENABLED: bool = True
+    DROP_ENERGY_JUMP: float = 0.22
+    DROP_MIN_GAP_SECONDS: float = 8.0
+    BUILD_MAX_SECONDS: float = 10.0
+    # Semente do sorteio de padrões (mesma música → mesma partitura).
+    MID_SEED: int = 7
+
+    # Precisão das transições.
+    TRANS_REFINE_ENABLED: bool = True
+    TRANS_REFINE_SEARCH_S: float = 0.9
+    TRANS_REFINE_MIN_RATIO: float = 2.0
+    TRANS_PREFER_DOWNBEAT: bool = True
+    # O quanto o brilho do efeito acompanha a energia ao vivo (0 = fixo).
+    TRANS_LIVE_GAIN: float = 0.35
 
 
 # ---------------------------------------------------------------------------
@@ -440,6 +225,7 @@ class TransitionEvent:
     pwm_brightness:  float
     beat_norm_after: float = 0.0
     kick_mean_after: float = 0.0
+    refined:         bool  = False
 
     def __repr__(self) -> str:
         fps   = 30
@@ -452,226 +238,1483 @@ class TransitionEvent:
 
 
 # ---------------------------------------------------------------------------
-# Sessão de reprodução (áudio)
+# Motor adaptativo dos LEDs do meio — ANÁLISE (offline, só numpy/scipy)
 # ---------------------------------------------------------------------------
+#
+# Como a partitura é gerada offline, a análise pode olhar para o FUTURO da
+# música (lookahead): detecta drops antes de acontecerem, sabe se um trecho vai
+# ser tonal ou percussivo, alinha o relógio dos passos ao grid de batidas real
+# e normaliza tudo localmente (AGC), então músicas baixas e altas usam toda a
+# faixa dinâmica dos LEDs.
+#
+# Mapa de bandas (LED do meio k  ←  banda k+1; a banda 0 é kick/sub e fica com
+# as pontas e com o brilho do passo):
+#
+#     banda 0  30–150 Hz    kick / sub          (pontas + acento)
+#     banda 1  150–400 Hz   grave-médio         → LED 1 (esquerda)
+#     banda 2  400–1500 Hz  médio / voz / caixa → LED 2
+#     banda 3  1.5–5 kHz    presença / ataque   → LED 3
+#     banda 4  5–10.5 kHz   brilho / hi-hat     → LED 4 (direita)
 
-class PlaybackSession:
-    def __init__(
-        self,
-        controller,
-        source: str,
-        duration_s: Optional[float],
-        youtube_video_source: Optional[str] = None,
-    ):
-        self.controller = controller
-        self.source = source
-        self.duration_s = duration_s
-        self.youtube_video_source = youtube_video_source
-        self.backend = "none"
-        self.player_name = "none"
-        self.proc: Optional[subprocess.Popen] = None
-        self.supports_pause = False
-        self.supports_seek = False
-        self.paused = False
-        self._base_pos_s = 0.0
-        self._started_at = 0.0
-        self._paused_acc = 0.0
-        self._pause_ts: Optional[float] = None
+MID_BAND_EDGES_HZ = (30.0, 150.0, 400.0, 1500.0, 5000.0, 10500.0)
+MID_NUM_BANDS = 5
 
-    def _reset_timing(self, base_pos_s: float = 0.0):
-        self._base_pos_s = max(0.0, float(base_pos_s))
-        self._started_at = time.monotonic()
-        self._paused_acc = 0.0
-        self._pause_ts = self._started_at if self.paused else None
 
-    def _set_paused_state(self, new_state: bool):
-        if new_state == self.paused:
-            return
-        now = time.monotonic()
-        if new_state:
-            self._pause_ts = now
-        else:
-            if self._pause_ts is not None:
-                self._paused_acc += max(0.0, now - self._pause_ts)
-            self._pause_ts = None
-        self.paused = new_state
+@dataclass
+class MiddleAnalysis:
+    n: int
+    fps: int
+    band_onset: np.ndarray      # (5, n) força do onset (0 fora dos picos)
+    support: np.ndarray         # (n,) 0..1 ataque contínuo: o que acontece AGORA
+    sustain: np.ndarray         # (n,) 0..1 quão sustentada (vs. percussiva) é a música
+    energy: np.ndarray          # (n,) 0..1  (global + local)
+    energy_slow: np.ndarray     # (n,) 0..1  (~3 s)
+    gate: np.ndarray            # (n,) 0..1  (0 = silêncio)
+    density: np.ndarray         # (n,) momentos com ataque por segundo
+    perc_ratio: np.ndarray      # (n,) 0..1 (percussivo vs. harmônico)
+    novelty: np.ndarray         # (n,) mudança de textura (p/ refinar transições)
+    beat_pos: np.ndarray        # (n,) posição em batidas (contínua)
+    period: np.ndarray          # (n,) frames por batida (local)
+    beat_conf: np.ndarray       # (n,) 0..1 confiança do pulso
+    beat_times: np.ndarray      # frames (float) de todas as batidas do grid
+    beat_origin: int            # índice de batida correspondente a pos=0
+    bar_offsets: np.ndarray     # offset de compasso por batida inteira
+    downbeat_conf: float
+    build_progress: np.ndarray  # (n,) 0..1 rumo ao próximo drop
+    drop_frames: list
+    info: dict
 
-    def _clock_elapsed(self) -> float:
-        now = time.monotonic()
-        pause_window = (now - self._pause_ts) if self._pause_ts is not None else 0.0
-        elapsed = self._base_pos_s + (now - self._started_at - self._paused_acc - pause_window)
-        if self.duration_s is not None:
-            elapsed = min(elapsed, float(self.duration_s))
-        return max(0.0, float(elapsed))
+    def bar_offset_at(self, pos: float) -> int:
+        k = int(math.floor(pos)) + int(self.beat_origin)
+        last = len(self.bar_offsets) - 1
+        k = 0 if k < 0 else (last if k > last else k)
+        return int(self.bar_offsets[k])
 
-    def start(self) -> bool:
-        if self.controller.show_youtube_video and self.youtube_video_source:
-            proc, player_name = self.controller._start_youtube_video_process(
-                self.youtube_video_source
-            )
-            if proc is not None:
-                self.backend = "proc"
-                self.proc = proc
-                self.player_name = player_name
-                self.supports_pause = os.name != "nt"
-                self.supports_seek = False
-                self.paused = False
-                self._reset_timing(0.0)
-                return True
+    def is_downbeat_index(self, k: int) -> bool:
+        k = min(max(int(k), 0), len(self.bar_offsets) - 1)
+        return ((k - int(self.beat_origin)) - int(self.bar_offsets[k])) % 4 == 0
 
-        if self.controller._is_url(self.source):
-            proc = self.controller._start_ffplay_process(
-                self.source,
-                "ffplay não encontrado para reproduzir stream.",
-            )
-            if proc is None:
-                return False
-            self.backend = "proc"
-            self.proc = proc
-            self.player_name = "ffplay"
-            self.supports_pause = os.name != "nt"
-            self.supports_seek = False
-            self.paused = False
-            self._reset_timing(0.0)
-            return True
 
-        try:
-            if not pygame.mixer.get_init():
-                pygame.mixer.init()
-            pygame.mixer.music.load(self.source)
-            pygame.mixer.music.play()
-            self.backend = "pygame"
-            self.player_name = "pygame"
-            self.supports_pause = True
-            self.supports_seek = True
-            self.paused = False
-            self._reset_timing(0.0)
-            return True
-        except Exception as exc:
-            log_warn(f"pygame falhou ({exc}). Usando ffplay...")
-            if pygame.mixer.get_init():
-                pygame.mixer.quit()
+class MiddleAnalyzer:
+    N_FFT = 1024
+    SUB_PER_GROUP = (3, 4, 6, 7, 5)
+    GROUP_MIN_DIST = (4, 4, 4, 3, 2)   # distância mínima entre onsets (frames)
 
-        proc = self.controller._start_ffplay_process(
-            self.source,
-            "ffplay não encontrado.",
+    def __init__(self, cfg, fps: int):
+        self.cfg = cfg
+        self.fps = int(fps)
+
+    # ------------------------------------------------------------------ #
+    # utilidades                                                           #
+    # ------------------------------------------------------------------ #
+
+    def _sec(self, seconds: float) -> int:
+        return max(1, int(round(seconds * self.fps)))
+
+    @staticmethod
+    def _uf(x, size):
+        size = max(1, int(size))
+        return ndi.uniform_filter1d(np.asarray(x, dtype=np.float64), size=size, mode="nearest")
+
+    def _subband_layout(self, sr):
+        n_bins = self.N_FFT // 2 + 1
+        freqs = np.fft.rfftfreq(self.N_FFT, 1.0 / sr)
+        nyq = sr / 2.0
+        rows, groups = [], []
+        for g in range(MID_NUM_BANDS):
+            lo = MID_BAND_EDGES_HZ[g]
+            hi = min(MID_BAND_EDGES_HZ[g + 1], nyq * 0.98)
+            if hi <= lo * 1.05:
+                hi = lo * 1.25
+            k = self.SUB_PER_GROUP[g]
+            edges = np.geomspace(lo, hi, k + 1)
+            for s in range(k):
+                sel = np.where((freqs >= edges[s]) & (freqs < edges[s + 1]))[0]
+                if sel.size == 0:
+                    centre = 0.5 * (edges[s] + edges[s + 1])
+                    sel = np.array([int(np.argmin(np.abs(freqs - centre)))])
+                row = np.zeros(n_bins, dtype=np.float32)
+                row[sel] = 1.0 / sel.size
+                rows.append(row)
+                groups.append(g)
+        return np.stack(rows), np.asarray(groups, dtype=np.int32)
+
+    def _spectrogram(self, y, W, n, spf):
+        """Retorna S_sub (n_sub, n) em amplitude e rms (n,) por frame de LED."""
+        n_fft = self.N_FFT
+        total = n * spf
+        m = min(len(y), total)
+
+        padded = np.zeros(total + n_fft, dtype=np.float32)
+        padded[n_fft // 2: n_fft // 2 + m] = np.asarray(y[:m], dtype=np.float32)
+
+        chunk_audio = np.zeros(total, dtype=np.float32)
+        chunk_audio[:m] = np.asarray(y[:m], dtype=np.float32)
+        rms = np.sqrt(np.mean(chunk_audio.reshape(n, spf) ** 2, axis=1) + 1e-12)
+
+        win = np.hanning(n_fft).astype(np.float32)
+        norm = 2.0 / float(win.sum())
+        offsets = np.arange(n_fft)[None, :]
+        starts_all = np.arange(n) * spf + spf // 2
+
+        S = np.empty((W.shape[0], n), dtype=np.float32)
+        CH = 2048
+        for c0 in range(0, n, CH):
+            c1 = min(n, c0 + CH)
+            idx = starts_all[c0:c1, None] + offsets
+            frames = padded[idx] * win
+            mag = np.abs(np.fft.rfft(frames, axis=1)).astype(np.float32) * norm
+            S[:, c0:c1] = np.sqrt(W @ (mag.T ** 2))
+        return S, rms.astype(np.float64)
+
+    @staticmethod
+    def _pick_peaks(x, thr, min_dist):
+        n = len(x)
+        out = np.zeros(n, dtype=np.float32)
+        if n < 3:
+            return out
+        mx = ndi.maximum_filter1d(x, size=5, mode="nearest")
+        cand = np.where((x >= mx) & (x >= thr))[0]
+        kept = []
+        for c in cand:
+            if not kept or c - kept[-1] >= min_dist:
+                kept.append(int(c))
+            elif x[c] > x[kept[-1]]:
+                kept[-1] = int(c)
+        for c in kept:
+            out[c] = x[c]
+        return out
+
+    def _local_norm(self, flux, win, scale_ref):
+        med = ndi.percentile_filter(flux, 50, size=win, mode="nearest")
+        hi = ndi.percentile_filter(flux, 95, size=win, mode="nearest")
+        g_med = float(np.median(flux))
+        g_hi = float(np.percentile(flux, 95))
+        floor = max(0.30 * (g_hi - g_med), 0.12 * scale_ref, 1e-9)
+        span = np.maximum(hi - med, floor)
+        return np.clip((flux - med) / span, 0.0, 1.0)
+
+    # ------------------------------------------------------------------ #
+    # grid de batidas                                                      #
+    # ------------------------------------------------------------------ #
+
+    def _beat_grid(self, beat_frames, n, tempo_bpm, onset_ref):
+        fps = self.fps
+        period_default = float(np.clip(fps * 60.0 / max(float(tempo_bpm), 1.0), 6.0, 2.0 * fps))
+
+        bf = np.asarray(beat_frames, dtype=np.float64).ravel()
+        bf = bf[np.isfinite(bf)]
+        bf = np.unique(bf[(bf >= 0) & (bf <= n + fps)])
+
+        used_synthetic = False
+        if len(bf) >= 4:
+            med = float(np.median(np.diff(bf)))
+            if med < 4.0 or med > 3.0 * fps:
+                bf = np.array([])
+        if len(bf) < 4:
+            # Sem batidas confiáveis: ancora no maior onset do começo e segue o BPM.
+            used_synthetic = True
+            head = onset_ref[: max(2, int(period_default * 2))]
+            anchor = float(np.argmax(head)) if len(head) else 0.0
+            bf = np.arange(anchor, n + period_default, period_default)
+
+        med = float(np.median(np.diff(bf))) if len(bf) > 1 else period_default
+
+        # remove duplicadas muito próximas e preenche lacunas do beat tracker
+        cleaned = [float(bf[0])]
+        for b in bf[1:]:
+            gap = float(b) - cleaned[-1]
+            if gap < 0.55 * med:
+                continue
+            if gap > 1.6 * med:
+                k = int(round(gap / med))
+                base = cleaned[-1]
+                for j in range(1, k):
+                    cleaned.append(base + gap * j / k)
+            cleaned.append(float(b))
+        bt = np.asarray(cleaned, dtype=np.float64)
+
+        # refinamento: puxa cada batida para o pico de onset mais próximo (±2 frames)
+        if not used_synthetic and len(onset_ref) > 5:
+            refined = bt.copy()
+            for k, b in enumerate(bt):
+                c = int(round(b))
+                lo, hi = max(0, c - 2), min(len(onset_ref) - 1, c + 2)
+                if hi <= lo:
+                    continue
+                local = onset_ref[lo:hi + 1]
+                peak = lo + int(np.argmax(local))
+                if peak != c and onset_ref[peak] >= 1.25 * onset_ref[min(max(c, 0), len(onset_ref) - 1)] + 1e-9:
+                    refined[k] = float(peak)
+            for k in range(1, len(refined)):
+                if refined[k] < refined[k - 1] + 2.0:
+                    refined[k] = bt[k] if bt[k] >= refined[k - 1] + 2.0 else refined[k - 1] + 2.0
+            bt = refined
+
+        local_med = float(np.median(np.diff(bt[: min(len(bt), 9)]))) if len(bt) > 2 else med
+        local_med = max(local_med, 3.0)
+        pre = []
+        b = bt[0] - local_med
+        while b > -2.0 * local_med and len(pre) < 4096:
+            pre.append(b)
+            b -= local_med
+        tail_med = float(np.median(np.diff(bt[-min(len(bt), 9):]))) if len(bt) > 2 else med
+        tail_med = max(tail_med, 3.0)
+        post = []
+        b = bt[-1] + tail_med
+        while b < n + 2.0 * tail_med and len(post) < 4096:
+            post.append(b)
+            b += tail_med
+        all_b = np.concatenate([np.asarray(pre[::-1], dtype=np.float64), bt, np.asarray(post, dtype=np.float64)])
+        n_pre = len(pre)
+
+        idx = np.arange(len(all_b), dtype=np.float64) - n_pre
+        t = np.arange(n, dtype=np.float64)
+        beat_pos = np.interp(t, all_b, idx)
+
+        ibi = np.diff(all_b)
+        ibi_s = ndi.median_filter(ibi, size=5, mode="nearest") if len(ibi) >= 5 else ibi
+        mid = 0.5 * (all_b[:-1] + all_b[1:])
+        period = np.clip(np.interp(t, mid, ibi_s), 3.0, 4.0 * fps)
+
+        return beat_pos, period, all_b, n_pre, bt, used_synthetic
+
+    def _beat_confidence(self, bt, onset_ref, n):
+        """Evidência de pulso: onset na batida vs. no meio entre batidas."""
+        if len(bt) < 4:
+            return np.zeros(n)
+        L = len(onset_ref)
+        ons, offs, centres = [], [], []
+        for k in range(len(bt) - 1):
+            b, nb = bt[k], bt[k + 1]
+            c = int(round(b))
+            m = int(round(0.5 * (b + nb)))
+            if c < 1 or m >= L - 1 or c >= L - 1:
+                continue
+            ons.append(float(np.max(onset_ref[c - 1:c + 2])))
+            offs.append(float(np.max(onset_ref[m - 1:m + 2])))
+            centres.append(b)
+        if len(ons) < 4:
+            return np.zeros(n)
+        ons, offs = np.asarray(ons), np.asarray(offs)
+        r = ons / (ons + offs + 1e-6)
+        r = self._uf(r, 8)
+        conf_b = np.clip((r - 0.5) / 0.28, 0.0, 1.0)
+        return np.interp(np.arange(n), np.asarray(centres), conf_b)
+
+    def _harmonic_change_at_beats(self, S, sub_group, all_b, n):
+        """Mudança do conteúdo grave/médio-grave (até 1,5 kHz) logo antes vs. depois
+        de cada batida. Acordes e notas de baixo costumam trocar no tempo 1."""
+        sel = sub_group <= 2
+        L = np.log1p(S[sel].astype(np.float64) / (0.02 * np.percentile(S[sel], 95, axis=1, keepdims=True) + 1e-9))
+        out = np.zeros(len(all_b))
+        for k, b in enumerate(all_b):
+            c = int(round(b))
+            pl = float(np.median(np.diff(all_b[max(0, k - 2):k + 3]))) if len(all_b) > 2 else 15.0
+            w = max(3, int(round(0.55 * pl)))
+            a0, a1 = c - w, c - 1
+            b0, b1 = c + 1, c + w
+            if a0 < 0 or b1 >= n:
+                continue
+            out[k] = float(np.linalg.norm(L[:, b0:b1 + 1].mean(1) - L[:, a0:a1 + 1].mean(1)))
+        mx = np.percentile(out, 95) + 1e-9
+        return np.clip(out / mx, 0.0, 1.5)
+
+    def _downbeats(self, all_b, n_pre, acc_curve, harm_change, boundary_frames, boundary_w, n):
+        """Fase do compasso (0..3 por batida). A fase quase nunca muda numa música,
+        então a decisão é GLOBAL (muitas amostras); só trocamos localmente com
+        evidência forte (1,5x) em janelas longas de 16 compassos."""
+        M = len(all_b)
+        L = len(acc_curve)
+        acc = np.zeros(M)
+        acc_mx = ndi.maximum_filter1d(acc_curve, size=3, mode="nearest")
+        for k in range(M):
+            c = int(round(all_b[k]))
+            if 0 <= c < L:
+                acc[k] = 0.40 * float(acc_mx[c]) + 0.60 * float(harm_change[k])
+
+        valid = np.array([0 <= int(round(b)) < L for b in all_b])
+        idx = np.arange(M)
+        phase = (idx - n_pre)
+        scores = np.array([float(acc[valid & (phase % 4 == o)].sum()) for o in range(4)])
+        # votos esparsos: viradas de seção e drops quase sempre caem no tempo 1
+        votes = np.zeros(4)
+        for f, w in zip(boundary_frames, boundary_w):
+            kb = int(np.argmin(np.abs(np.asarray(all_b) - f)))
+            pl = float(np.median(np.diff(all_b[max(0, kb - 2):kb + 3]))) if M > 2 else 15.0
+            if abs(all_b[kb] - f) <= 0.6 * pl:
+                votes[(kb - n_pre) % 4] += w
+        if votes.sum() > 0 and scores.sum() > 0 and len(boundary_frames) >= 2:
+            scores = 0.35 * scores / scores.sum() + 0.65 * votes / votes.sum()
+        glob = int(np.argmax(scores))
+        srt = np.sort(scores)[::-1]
+        conf = float((srt[0] - srt[1]) / (srt[0] + 1e-9)) if srt[0] > 0 else 0.0
+
+        offsets = np.full(M, glob, dtype=np.int32)
+        chunk, stride = 64, 32
+        cur = glob
+        for s in range(0, max(M - chunk // 2, 1), stride):
+            e = min(M, s + chunk)
+            if e - s < chunk // 2:
+                break
+            sl = slice(s, e)
+            sc = np.array([float(acc[sl][(phase[sl] - o) % 4 == 0].sum()) for o in range(4)])
+            best = int(np.argmax(sc))
+            if best != cur and sc[best] > 1.5 * sc[cur]:
+                cur = best
+            elif best == glob and cur != glob and sc[glob] > 1.15 * sc[cur]:
+                cur = glob
+            offsets[s:min(M, s + stride)] = cur
+            if e >= M:
+                offsets[s:] = cur
+        return offsets, conf
+
+    # ------------------------------------------------------------------ #
+    # drops / buildups                                                     #
+    # ------------------------------------------------------------------ #
+
+    def _detect_drops(self, energy, e_slow, bass_db, rms_s, all_b, n_pre, bar_offsets, period, n):
+        """Drops com várias pistas (lookahead): salto de energia, retorno do grave
+        (em dB, que não satura como a energia normalizada) e micro-silêncio antes
+        do impacto. O buildup só existe quando há SUBIDA real antes do drop."""
+        cfg, fps = self.cfg, self.fps
+        drops = []
+        build = np.zeros(n, dtype=np.float64)
+        if not cfg.DROP_DETECT_ENABLED or n < 6 * fps:
+            return drops, build
+
+        e_fast = self._uf(energy, self._sec(0.5))
+        w = self._sec(1.5)
+        t = np.arange(n)
+        a0, a1 = np.clip(t - w, 0, n), t
+        b0, b1 = t, np.clip(t + w, 0, n)
+
+        def win_mean(arr):
+            cs = np.concatenate([[0.0], np.cumsum(arr)])
+            return (cs[a1] - cs[a0]) / np.maximum(a1 - a0, 1), (cs[b1] - cs[b0]) / np.maximum(b1 - b0, 1)
+
+        e_before, e_after = win_mean(e_fast)
+        b_before, b_after = win_mean(bass_db)
+        jump_e = e_after - e_before
+        jump_b = np.clip((b_after - b_before) / 12.0, -1.0, 1.5)     # 12 dB de grave = 1.0
+        # o grave "voltou" quando fica perto do seu nível máximo na faixa toda
+        bass_ref = float(np.percentile(bass_db, 90))
+        bass_return = np.clip(1.0 + (b_after - bass_ref) / 12.0, 0.0, 1.0)
+
+        # micro-silêncio: o trecho logo antes do frame é bem mais baixo que o anterior
+        gap_s = self._sec(0.5)
+        cs_r = np.concatenate([[0.0], np.cumsum(rms_s)])
+        near = (cs_r[t] - cs_r[np.clip(t - gap_s, 0, n)]) / np.maximum(t - np.clip(t - gap_s, 0, n), 1)
+        far_lo, far_hi = np.clip(t - self._sec(2.0), 0, n), np.clip(t - gap_s, 0, n)
+        far = (cs_r[far_hi] - cs_r[far_lo]) / np.maximum(far_hi - far_lo, 1)
+        gap = np.clip(1.0 - near / (0.45 * far + 1e-9), 0.0, 1.0)
+
+        # um drop é o FIM da subida: se a energia continua subindo depois, é só
+        # meio de buildup / crescendo e não deve ser marcado.
+        nb0, nb1 = np.clip(t + w, 0, n), np.clip(t + 2 * w, 0, n)
+        cs_e = np.concatenate([[0.0], np.cumsum(e_fast)])
+        e_next = np.where(nb1 > nb0, (cs_e[nb1] - cs_e[nb0]) / np.maximum(nb1 - nb0, 1), e_after)
+        still_rising = np.maximum(e_next - e_after - 0.03, 0.0)
+
+        score = (
+            np.minimum(np.maximum(jump_e, 0.0), 0.6)
+            + 0.45 * np.clip(jump_b, 0.0, 1.0) * bass_return
+            + 0.20 * gap
+            - 1.5 * still_rising
         )
-        if proc is None:
-            return False
-        self.backend = "proc"
-        self.proc = proc
-        self.player_name = "ffplay"
-        self.supports_pause = os.name != "nt"
-        self.supports_seek = False
-        self.paused = False
-        self._reset_timing(0.0)
-        return True
+        thr = float(cfg.DROP_ENERGY_JUMP)
+        mx = ndi.maximum_filter1d(score, size=2 * w + 1, mode="nearest")
+        evidence = (jump_e >= 0.10) | (jump_b >= 0.45)
+        cand = np.where((score >= mx) & (score >= thr) & evidence & (e_after >= 0.45))[0]
 
-    def is_alive(self) -> bool:
-        if self.backend == "pygame":
-            return self.paused or pygame.mixer.music.get_busy()
-        if self.proc is not None:
-            return self.proc.poll() is None
-        return False
+        min_gap = self._sec(cfg.DROP_MIN_GAP_SECONDS)
+        kept = []
+        for c in cand:
+            if c < self._sec(2.0) or c > n - self._sec(1.0):
+                continue
+            if not kept or c - kept[-1] >= min_gap:
+                kept.append(int(c))
+            elif score[c] > score[kept[-1]]:
+                kept[-1] = int(c)
 
-    def position_s(self) -> float:
-        return self._clock_elapsed()
+        for c in kept:
+            # refina: maior subida local do grave+energia em ±0,7 s
+            lo, hi = max(3, c - self._sec(0.7)), min(n - 4, c + self._sec(0.7))
+            rise = (e_fast[lo + 3:hi + 3] - e_fast[lo - 3:hi - 3]) + 0.05 * (bass_db[lo + 3:hi + 3] - bass_db[lo - 3:hi - 3])
+            f = lo + int(np.argmax(rise)) if len(rise) else c
+            # encaixa na batida mais próxima, preferindo o tempo 1 do compasso
+            k0 = int(np.searchsorted(all_b, f))
+            best_k, best_cost = None, 1e9
+            pl = float(period[min(max(int(f), 0), n - 1)])
+            for k in range(max(0, k0 - 2), min(len(all_b), k0 + 2)):
+                d = abs(all_b[k] - f)
+                if d > 0.75 * pl:
+                    continue
+                is_down = ((k - n_pre) - int(bar_offsets[min(k, len(bar_offsets) - 1)])) % 4 == 0
+                cost = d - (0.5 * pl if is_down else 0.0)
+                if cost < best_cost:
+                    best_cost, best_k = cost, k
+            if best_k is not None:
+                f = int(round(all_b[best_k]))
+            drops.append(int(np.clip(f, 0, n - 1)))
+        drops = sorted(set(drops))
 
-    def pause(self, should_pause: bool) -> bool:
-        if not self.supports_pause:
-            return False
-        if should_pause == self.paused:
-            return True
+        # buildup: varre PARA TRÁS a partir do drop enquanto a energia vinha subindo
+        e_s = self._uf(energy, self._sec(1.0))
+        step = self._sec(0.5)
+        prev_drop = -10 ** 9
+        for f in drops:
+            limit = max(prev_drop + self._sec(2.0), f - self._sec(cfg.BUILD_MAX_SECONDS), 0)
+            probe = f - self._sec(0.6)            # ignora o micro-silêncio colado no drop
+            start = probe
+            while start - step >= limit and e_s[start - step] <= e_s[start] + 0.02:
+                start -= step
+            risen = float(e_s[max(probe, 0)] - e_s[max(start, 0)])
+            if (f - start) >= self._sec(2.0) and risen >= 0.08:
+                seg_t = np.arange(start, f)
+                build[start:f] = np.maximum(build[start:f], ((seg_t - start) / float(f - start)) ** 1.15)
+            prev_drop = f
+        return drops, build
 
-        if self.backend == "pygame":
-            try:
-                if should_pause:
-                    pygame.mixer.music.pause()
+    # ------------------------------------------------------------------ #
+    # ponto de entrada                                                     #
+    # ------------------------------------------------------------------ #
+
+    def _novelty(self, rms_s, S, sub_group, density, perc_ratio, n):
+        """Mudança de textura entre os 0,6 s antes e depois de cada frame
+        (energia + 5 bandas + densidade + perc/harm). Pico = ponto exato da virada."""
+        feats = [20.0 * np.log10(rms_s + 1e-5)]
+        for g in range(MID_NUM_BANDS):
+            amp = np.sqrt(np.mean(S[sub_group == g].astype(np.float64) ** 2, axis=0))
+            feats.append(np.maximum(20.0 * np.log10(self._uf(amp, 3) + 1e-5), -80.0))
+        feats.append(self._uf(density, self._sec(1.0)))
+        feats.append(perc_ratio)
+        F = np.vstack(feats)
+        med = np.median(F, axis=1, keepdims=True)
+        mad = np.median(np.abs(F - med), axis=1, keepdims=True) * 1.4826 + 1e-6
+        Z = np.clip((F - med) / mad, -6.0, 6.0)
+        w = self._sec(0.6)
+        cs = np.concatenate([np.zeros((Z.shape[0], 1)), np.cumsum(Z, axis=1)], axis=1)
+        t = np.arange(n)
+        a0, a1 = np.clip(t - w, 0, n), t
+        b0, b1 = t, np.clip(t + w, 0, n)
+        before = (cs[:, a1] - cs[:, a0]) / np.maximum(a1 - a0, 1)
+        after = (cs[:, b1] - cs[:, b0]) / np.maximum(b1 - b0, 1)
+        diff = after - before
+        # entradas (algo novo começa) pesam mais que quedas (decaimento de prato,
+        # fim de fill, cauda de reverb): essas não são viradas de seção.
+        diff = np.where(diff > 0.0, diff, 0.55 * diff)
+        return np.linalg.norm(diff, axis=0)
+
+    def analyze(self, y, sr, n_frames, tempo_bpm, beat_frames) -> MiddleAnalysis:
+        cfg, fps = self.cfg, self.fps
+        n = max(1, int(n_frames))
+        spf = max(1, int(sr / fps))
+
+        W, sub_group = self._subband_layout(sr)
+        S, rms = self._spectrogram(y, W, n, spf)
+        n_sub = S.shape[0]
+
+        # ---- HPSS leve (no domínio das sub-bandas) --------------------- #
+        t_k = max(3, self._sec(0.5) | 1)
+        Hh = ndi.median_filter(S, size=(1, t_k), mode="nearest")
+        Pp = ndi.median_filter(S, size=(5, 1), mode="nearest")
+        mask_p = (Pp ** 2) / (Hh ** 2 + Pp ** 2 + 1e-12)
+        Sp = S * mask_p
+        Sh = S - Sp
+        Ep = np.sum(Sp.astype(np.float64) ** 2, axis=0)
+        Eh = np.sum(Sh.astype(np.float64) ** 2, axis=0)
+        perc_ratio = self._uf(Ep / (Ep + Eh + 1e-12), self._sec(1.5))
+
+        # ---- fluxo espectral por banda → onsets ------------------------- #
+        S_on = Sp + 0.4 * Sh
+        ref = 0.02 * np.percentile(S_on, 95, axis=1) + 1e-9
+        L = np.log1p(S_on / ref[:, None])
+        d = np.maximum(L[:, 1:] - L[:, :-1], 0.0)
+        flux_sub = np.concatenate([np.zeros((n_sub, 1), dtype=np.float32), d], axis=1)
+        flux_g = np.zeros((MID_NUM_BANDS, n), dtype=np.float64)
+        for g in range(MID_NUM_BANDS):
+            flux_g[g] = np.mean(flux_sub[sub_group == g], axis=0)
+        scale_ref = float(max(np.percentile(flux_g[g], 95) for g in range(MID_NUM_BANDS)))
+        win_norm = self._sec(4.0)
+        norm_g = np.zeros_like(flux_g)
+        onset = np.zeros((MID_NUM_BANDS, n), dtype=np.float32)
+        for g in range(MID_NUM_BANDS):
+            norm_g[g] = self._local_norm(flux_g[g], win_norm, scale_ref)
+        kick_curve = np.clip(norm_g[0] - 0.45 * np.maximum(norm_g[3], norm_g[4]), 0.0, 1.0)
+        for g in range(MID_NUM_BANDS):
+            curve = kick_curve if g == 0 else norm_g[g]
+            onset[g] = self._pick_peaks(curve, float(cfg.MID_HIT_THRESHOLD), self.GROUP_MIN_DIST[g])
+
+        ev = (onset > 0).any(axis=0).astype(np.float64)   # momentos distintos com ataque
+        density = self._uf(ev, self._sec(2.0)) * fps
+
+        # ataque contínuo: quanto "está acontecendo" em cada frame (kick pesa mais)
+        weights = (1.0, 0.7, 0.9, 0.8, 0.5)
+        supp = np.max([weights[g] * norm_g[g] for g in range(MID_NUM_BANDS)], axis=0)
+        support = np.clip(ndi.maximum_filter1d(supp, size=3, mode="nearest"), 0.0, 1.0)
+
+        perc_n = np.clip((perc_ratio - 0.30) / 0.45, 0.0, 1.0)
+        sustain = np.clip(1.0 - perc_n, 0.0, 1.0)
+
+        # ---- energia / silêncio ---------------------------------------- #
+        rms_s = self._uf(rms, self._sec(0.4))
+        db = 20.0 * np.log10(rms_s + 1e-5)
+        lo_db, hi_db = np.percentile(db, [8, 96])
+        if hi_db - lo_db < 6.0:
+            hi_db = lo_db + 6.0
+        e_global = np.clip((db - lo_db) / (hi_db - lo_db), 0.0, 1.0)
+        p90_loc = ndi.percentile_filter(rms_s, 90, size=self._sec(2.0), mode="nearest")
+        e_local = np.clip(rms_s / (p90_loc + 1e-9), 0.0, 1.0)
+        energy = np.clip(0.5 * e_global + 0.5 * e_local, 0.0, 1.0)
+        energy_slow = np.clip(self._uf(e_global, self._sec(3.0)), 0.0, 1.0)
+        silence = (rms_s < 10.0 ** (-56.0 / 20.0)).astype(np.float64)
+        gate = np.clip(1.0 - self._uf(silence, 5) * 1.5, 0.0, 1.0)
+
+        # ---- batidas / compasso ----------------------------------------- #
+        onset_ref = (norm_g[0] + norm_g[1] + norm_g[2]) / 3.0
+        beat_pos, period, all_b, n_pre, bt, synthetic = self._beat_grid(
+            beat_frames, n, tempo_bpm, onset_ref
+        )
+        beat_conf = self._beat_confidence(bt, onset_ref, n)
+        acc_curve = 0.55 * norm_g[0] + 0.25 * norm_g[1] + 0.20 * norm_g[2]
+        bass_amp = np.sqrt(np.mean(S[sub_group == 0].astype(np.float64) ** 2, axis=0))
+        bass_db = self._uf(20.0 * np.log10(bass_amp + 1e-5), self._sec(0.4))
+        harm_change = self._harmonic_change_at_beats(S, sub_group, all_b, n)
+        novelty = self._novelty(rms_s, S, sub_group, density, perc_ratio, n)
+        nov_n = novelty / (float(np.max(novelty)) + 1e-9)
+        nov_peaks = self._pick_peaks(nov_n, 0.30, self._sec(2.0))
+        b_frames = np.where(nov_peaks > 0)[0]
+        b_w = nov_peaks[b_frames]
+        bar_offsets, db_conf = self._downbeats(all_b, n_pre, acc_curve, harm_change, b_frames, b_w, n)
+
+        # ---- drops / buildups ------------------------------------------ #
+        drops, build = self._detect_drops(
+            energy, energy_slow, bass_db, rms_s, all_b, n_pre, bar_offsets, period, n
+        )
+
+        info = {
+            "synthetic_grid": bool(synthetic),
+            "mean_beat_conf": float(np.mean(beat_conf)),
+            "mean_density": float(np.mean(density)),
+            "mean_perc_ratio": float(np.mean(perc_ratio)),
+            "onsets": [int(np.count_nonzero(onset[g])) for g in range(MID_NUM_BANDS)],
+            "n_beats": int(len(bt)),
+        }
+        return MiddleAnalysis(
+            n=n, fps=fps, band_onset=onset, support=support, sustain=sustain,
+            energy=energy, energy_slow=energy_slow, gate=gate, density=density,
+            perc_ratio=perc_ratio, novelty=novelty, beat_pos=beat_pos, period=period,
+            beat_conf=beat_conf, beat_times=np.asarray(all_b, dtype=np.float64),
+            beat_origin=int(n_pre), bar_offsets=bar_offsets,
+            downbeat_conf=float(db_conf), build_progress=build,
+            drop_frames=drops, info=info,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Motor dos LEDs do meio — RENDERIZAÇÃO (frame a frame)
+# ---------------------------------------------------------------------------
+#
+# A SEQUÊNCIA (MIDDLE_SEQUENCES) é sempre o esqueleto visual. A música entra em:
+#
+#   TEMPO       passo travado no grid de batidas (PLL); subdivisão por compasso
+#               com histerese e piso perceptivo de duração de passo.
+#   INTENSIDADE cada passo acende conforme o ATAQUE REAL naquele instante
+#               (support): passo em cima de kick/caixa brilha, passo em cima de
+#               nada, não. A posição métrica (tempo 1) dá acento.
+#   FADE        a cauda depende de quão sustentada é a música (staccato = corta
+#               rápido, pad/sustain = escorre) e da duração do passo.
+#   FRASE       o padrão só troca em início de compasso, e SEMPRE no início de
+#               cada seção detectada (transição): a sequência "vira de página"
+#               junto com a música.
+#   DROP        micro-apagão + flash curto no tempo 1 do drop.
+#   GOVERNOR    trava anti-saturação: a média de LEDs acesos nunca passa de
+#               MID_MAX_LIT_AVG, qualquer que seja a música.
+
+# Padrões extras: só entram se cfg.MID_EXTRA_PATTERNS=True.
+_MID_EXTRA_PATTERNS = (
+    ((0,), (1,), (2,), (3,), (2,), (1,)),                # ping-pong
+    ((0, 3), (1, 2)),                                    # fora → dentro
+    ((1, 2), (0, 3)),                                    # dentro → fora
+)
+
+
+class MiddleRenderer:
+    KICK_DECAY = 0.72
+    BEAT_DECAY = 0.80
+    DROP_DARK_FRAMES = 2
+    FLASH_DECAY = 0.86
+
+    def __init__(self, cfg, fps: int, ma: MiddleAnalysis, speed_mult: float, n_frames: int,
+                 section_frames=()):
+        self.cfg = cfg
+        self.fps = int(fps)
+        self.ma = ma
+        self.rng = random.Random(int(cfg.MID_SEED) * 100003 + int(n_frames))
+
+        self._period = ma.period.tolist()
+        self._beat_pos = ma.beat_pos.tolist()
+        self._energy = ma.energy.tolist()
+        self._gate = ma.gate.tolist()
+        self._support = ma.support.tolist()
+        self._sustain = ma.sustain.tolist()
+        self._build = ma.build_progress.tolist()
+        self._onset = [ma.band_onset[g].tolist() for g in range(MID_NUM_BANDS)]
+        self._drops = list(ma.drop_frames)
+        self._drop_idx = 0
+        self._sections = sorted(int(f) for f in section_frames)
+        self._section_idx = 0
+
+        seen, lib = set(), []
+        base = tuple(cfg.MIDDLE_SEQUENCES)
+        if cfg.MID_EXTRA_PATTERNS:
+            base = base + _MID_EXTRA_PATTERNS
+        for p in base:
+            key = tuple(tuple(step) for step in p)
+            if key not in seen:
+                seen.add(key)
+                lib.append(key)
+        self.library = lib
+
+        self.spb_base = (1.0 / max(float(cfg.BPM_STEP_MULT), 1e-3)) * float(speed_mult)
+
+        coverage = 0.6 if ma.info.get("synthetic_grid") else 1.0
+        self.lock = float(np.clip(cfg.BPM_CONTINUOUS_SYNC_STRENGTH * (0.65 + 0.90 * coverage) * 2.5, 0.04, 0.30))
+        self.resync = float(np.clip(cfg.BPM_RESYNC_STRENGTH * (0.70 + 0.35 * min(coverage, 1.0)), 0.35, 0.98))
+
+        self.pos = float(self._beat_pos[0])
+        self.prev_pos = self.pos
+        self.bar = None
+        self.spb = self.spb_base
+        self._factor = 1.0
+        self._factor_votes = 0
+        self.sub_phase = 0.0
+        self.pattern = None
+        self.step_idx = 0
+        self.loop_count = 0
+        self.cur_step = (0,)
+        self.triggered = False
+        self.accent = 1.0
+        self.bars_since_switch = 0
+        self._force_switch = False
+
+        self.chase = [0.0] * 4
+        self.kick_env = 0.0
+        self.kick_win = 0
+        self.kick_window_frames = max(1, int((cfg.KICK_WINDOW_MS / 1000.0) * self.fps))
+        self.beat_env = 0.0
+        self.flash = 0.0
+        self.lit_ema = 1.5
+
+        self.stats = {"bars": 0, "pattern_switches": 0, "section_switches": 0,
+                      "spb_hist": {}, "drops_fired": 0, "build_frames": 0,
+                      "governor_frames": 0, "steps": 0}
+
+    # ------------------------------------------------------------------ #
+    # subdivisão / padrões                                                 #
+    # ------------------------------------------------------------------ #
+
+    def _clamp_spb(self, spb: float, period: float) -> float:
+        cfg = self.cfg
+        lo_frames = max(2.0, float(cfg.STEP_FRAMES_MIN), float(cfg.MID_MIN_STEP_FRAMES))
+        hi_frames = max(lo_frames + 1.0, float(cfg.STEP_FRAMES_MAX))
+        spb = float(min(16.0, max(0.25, spb)))
+        while period / spb < lo_frames and spb > 0.25:
+            spb *= 0.5
+        while period / spb > hi_frames and spb < 16.0:
+            spb *= 2.0
+        return spb
+
+    def _pick_pattern(self, energy: float, hard: bool = False):
+        steps_bar = 4.0 * self.spb
+        cands, weights = [], []
+        for p in self.library:
+            if p == self.pattern and len(self.library) > 1:
+                continue
+            L = len(p)
+            heat = sum(len(s) for s in p) / (4.0 * L)
+            target = float(np.clip(0.15 + 1.7 * heat, 0.25, 0.95))
+            e = 0.95 if hard else energy
+            w = math.exp(-((e - target) / 0.40) ** 2) + 0.06
+            ratio = steps_bar / L
+            aligned = (ratio >= 1.0 and abs(ratio - round(ratio)) < 1e-6) or \
+                      (ratio < 1.0 and abs(1.0 / ratio - round(1.0 / ratio)) < 1e-6)
+            if not aligned:
+                w *= 0.35
+            if hard and heat < 0.5:
+                w *= 0.15
+            cands.append(p)
+            weights.append(w)
+        if not cands:
+            return self.pattern or self.library[0]
+        r = self.rng.random() * sum(weights)
+        acc = 0.0
+        for c, w in zip(cands, weights):
+            acc += w
+            if r <= acc:
+                return c
+        return cands[-1]
+
+    def _set_pattern(self, pattern):
+        self.pattern = pattern
+        self.step_idx = 0
+        self.loop_count = 0
+        self.cur_step = pattern[0]
+        self.triggered = True
+        self.accent = 1.1
+        self.bars_since_switch = 0
+        self.stats["pattern_switches"] += 1
+
+    def _align_to_beat(self):
+        """Alinha a subfase dos passos à batida mais próxima (início de frase)."""
+        self.sub_phase = ((self.pos - round(self.pos)) * self.spb) % 1.0
+
+    def _advance_step(self):
+        self.step_idx += 1
+        if self.step_idx >= len(self.pattern):
+            self.step_idx = 0
+            self.loop_count += 1
+        self.cur_step = self.pattern[self.step_idx]
+        self.triggered = True
+        self.stats["steps"] += 1
+        fp = self.pos % 1.0
+        on_beat = fp < 0.14 or fp > 0.86
+        if on_beat:
+            off = self.ma.bar_offset_at(self.pos)
+            beat_in_bar = (int(math.floor(self.pos + 0.14)) - off) % 4
+            emphasis = min(1.0, 0.4 + 2.0 * self.ma.downbeat_conf)
+            self.accent = 1.0 + (0.12 * emphasis if beat_in_bar == 0 else 0.0)
+        else:
+            self.accent = 0.84
+
+    def _conf_at(self, i: int) -> float:
+        return float(self.ma.beat_conf[min(max(i, 0), self.ma.n - 1)])
+
+    def _on_new_bar(self, i: int):
+        cfg, ma = self.cfg, self.ma
+        n = ma.n
+        period = max(2.0, self._period[i])
+        j = min(n, i + max(1, int(4 * period)))
+        if j > i:
+            e_bar = float(np.mean(ma.energy[i:j]))
+            dens = float(np.mean(ma.density[i:j]))
+        else:
+            e_bar, dens = self._energy[i], 0.0
+        epb = dens * period / self.fps
+
+        # subdivisão com histerese: só muda após 2 compassos consecutivos pedindo
+        target = 1.0
+        if cfg.MID_AUTO_SUBDIVISION:
+            if epb < cfg.MID_DENSITY_SPARSE_EPB:
+                target = 0.5
+            elif epb > cfg.MID_DENSITY_DENSE_EPB and self._conf_at(i) > 0.35:
+                target = 2.0
+        if self.pattern is None:
+            self._factor, self._factor_votes = target, 0
+        elif target == self._factor:
+            self._factor_votes = 0
+        else:
+            self._factor_votes += 1
+            if self._factor_votes >= 2:
+                self._factor, self._factor_votes = target, 0
+
+        spb = self.spb_base * self._factor
+        p = self._build[i]
+        if p > 0.02:
+            spb *= 2.0 ** min(2, int(p * 2.6))
+            self.stats["build_frames"] += int(4 * period)
+        spb = self._clamp_spb(spb, period)
+        changed = abs(spb - self.spb) > 1e-9
+        self.spb = spb
+
+        self.bars_since_switch += 1
+        switch = (
+            self.pattern is None
+            or self._force_switch
+            or (
+                self.loop_count >= max(1, int(cfg.MIDDLE_SEQ_SWITCH_REPEATS))
+                and self.bars_since_switch >= max(1, int(cfg.MID_MIN_BARS_PER_PATTERN))
+            )
+        )
+        if switch:
+            self._set_pattern(self._pick_pattern(e_bar, hard=False))
+            self._force_switch = False
+        if changed or switch:
+            off = ma.bar_offset_at(self.pos)
+            bar_start = self.bar * 4.0 + off
+            self.sub_phase = ((self.pos - bar_start) * self.spb) % 1.0
+
+        self.stats["bars"] += 1
+        key = f"{self.spb:g}"
+        self.stats["spb_hist"][key] = self.stats["spb_hist"].get(key, 0) + 1
+
+    # ------------------------------------------------------------------ #
+    # frame                                                                #
+    # ------------------------------------------------------------------ #
+
+    def frame(self, i: int, startup_gain: float, edge_pulse: float,
+              trans_active: bool, trans_just_ended: bool):
+        cfg, ma = self.cfg, self.ma
+        i = min(max(i, 0), ma.n - 1)
+        MAX, MIN = float(cfg.ACTIVE_MAX_PWM), float(cfg.ACTIVE_MIN_PWM)
+        period = max(2.0, self._period[i])
+
+        # ---- 1. relógio (PLL no grid de batidas) -------------------------- #
+        self.prev_pos = self.pos
+        self.pos += 1.0 / period
+        err = self._beat_pos[i] - self.pos
+        if trans_just_ended:
+            self.pos += self.resync * err
+        elif not trans_active:
+            self.pos += (self.resync if abs(err) > 0.30 else self.lock) * err
+        if self.pos < self.prev_pos:
+            self.pos = self.prev_pos
+        dpos = self.pos - self.prev_pos
+
+        # ---- 2. passos ---------------------------------------------------- #
+        self.triggered = False
+        if self.pattern is not None:
+            self.sub_phase += dpos * self.spb
+            while self.sub_phase >= 1.0:
+                self.sub_phase -= 1.0
+                self._advance_step()
+
+        # ---- 3. compasso -------------------------------------------------- #
+        off = ma.bar_offset_at(self.pos)
+        bar = int(math.floor((self.pos - off) / 4.0))
+        if bar != self.bar:
+            self.bar = bar
+            self._on_new_bar(i)
+
+        # ---- 4. nova SEÇÃO: a sequência vira de página junto com a música -- #
+        while self._section_idx < len(self._sections) and i >= self._sections[self._section_idx]:
+            self._section_idx += 1
+            if self.pattern is not None:
+                self._set_pattern(self._pick_pattern(self._energy[i], hard=False))
+                self._align_to_beat()
+                self.stats["section_switches"] += 1
+
+        # ---- 5. drop ------------------------------------------------------ #
+        dark = False
+        if self._drop_idx < len(self._drops):
+            f = self._drops[self._drop_idx]
+            if f - self.DROP_DARK_FRAMES <= i < f:
+                dark = True
+            elif i >= f:
+                self._drop_idx += 1
+                self.stats["drops_fired"] += 1
+                self.flash = min(245.0, MAX * 1.25)
+                if self.pattern is not None:
+                    self._set_pattern(self._pick_pattern(0.95, hard=True))
+                    self._align_to_beat()
+        if dark:
+            self.chase = [0.0] * 4
+            self.kick_env = 0.0
+            self.flash = 0.0
+            return [0.0] * 4, 0
+
+        # ---- 6. features do frame ---------------------------------------- #
+        energy = self._energy[i]
+        gate = self._gate[i]
+        kick_hit = self._onset[0][i]
+        self.kick_env *= self.KICK_DECAY
+        if kick_hit > 0.0:
+            self.kick_env = max(self.kick_env, kick_hit)
+            self.kick_win = self.kick_window_frames
+        bo = max(self._onset[1][i], self._onset[2][i], self._onset[3][i])
+        self.beat_env = max(self.beat_env * self.BEAT_DECAY, bo)
+        build_p = self._build[i]
+
+        # ---- 7. brilho do passo (alavancas originais + ataque real) ------- #
+        nrg = energy ** 0.85
+        base = MIN + (MAX - MIN) * nrg + cfg.BEAT_BOOST_PWM * self.beat_env
+        if self.beat_env > cfg.HEAVY_BEAT_THRESHOLD:
+            base += 25.0 * (self.beat_env - cfg.HEAVY_BEAT_THRESHOLD) / max(1e-6, 1.0 - cfg.HEAVY_BEAT_THRESHOLD)
+        ks = self.kick_env
+        base += cfg.MIDDLE_KICK_BRIGHT_GAIN * ks
+        if ks > 0.7:
+            base += cfg.MIDDLE_STRONG_KICK_BRIGHT_GAIN * ((ks - 0.7) / 0.3)
+        if self.kick_win > 0:
+            base += cfg.MIDDLE_KICK_WINDOW_BRIGHT_GAIN * (0.4 + 0.6 * ks)
+        if build_p > 0.0:
+            base *= 0.6 + 0.4 * build_p
+        active_pwm = float(np.clip(base * startup_gain, MIN * 0.45, MAX))
+
+        # o passo acompanha o ataque que REALMENTE existe nesse instante
+        depth = float(cfg.MID_SUPPORT_DEPTH)
+        lo_i, hi_i = max(0, i - 1), min(ma.n - 1, i + 1)
+        support = max(self._support[lo_i], self._support[i], self._support[hi_i])
+        step_gain = (1.0 - depth) + depth * support
+
+        # ---- 8. chase: pulso + hold + cauda guiada pela música ------------ #
+        step_frames = max(1.0, period / self.spb)
+        sustain = self._sustain[i]
+        fade_base = float(np.clip(cfg.MIDDLE_FADE_DECAY * (0.80 + 0.45 * sustain), 0.20, 0.93))
+        tail = fade_base ** (8.0 / step_frames)
+        pulse_decay = 0.5 ** (1.0 / max(0.35 * step_frames, 1.0))
+        floor_v = active_pwm * cfg.MID_STEP_FLOOR
+        lit = self.cur_step
+        for k in range(4):
+            if k in lit:
+                if self.triggered:
+                    v = max(self.chase[k], active_pwm * self.accent * step_gain)
                 else:
-                    pygame.mixer.music.unpause()
-            except Exception:
-                return False
-            self._set_paused_state(should_pause)
-            return True
+                    v = self.chase[k] * pulse_decay
+                if kick_hit > 0.0:
+                    v = max(v, active_pwm)
+                self.chase[k] = min(255.0, max(v, floor_v * (0.80 + 0.20 * step_gain)))
+            else:
+                self.chase[k] *= tail
+        if edge_pulse >= cfg.EDGE_SYNC_MIN_PWM:
+            ss = float(np.clip(edge_pulse / 255.0, 0.0, 1.0))
+            for k in lit:
+                self.chase[k] = min(255.0, self.chase[k] + cfg.MIDDLE_EDGE_SYNC_GAIN * ss)
+        out = list(self.chase)
 
-        if self.proc is None or self.proc.poll() is not None or os.name == "nt":
-            return False
-        try:
-            self.proc.send_signal(signal.SIGSTOP if should_pause else signal.SIGCONT)
-        except Exception:
-            return False
-        self._set_paused_state(should_pause)
-        return True
+        # ---- 9. drop: flash curto ----------------------------------------- #
+        if self.flash > 1.0:
+            shape = (0.85, 1.0, 1.0, 0.85)
+            for k in range(4):
+                out[k] = max(out[k], self.flash * shape[k])
+            self.flash *= self.FLASH_DECAY
+        else:
+            self.flash = 0.0
 
-    def seek(self, delta_s: int) -> bool:
-        if self.backend != "pygame":
-            return False
+        # ---- 10. governor anti-saturação ---------------------------------- #
+        n_lit = sum(1 for v in out if v >= 0.50 * MAX)
+        self.lit_ema += 0.05 * (n_lit - self.lit_ema)
+        cap = float(cfg.MID_MAX_LIT_AVG)
+        if self.lit_ema > cap and self.flash <= 1.0:
+            g = max(0.30, cap / self.lit_ema)
+            for k in range(4):
+                if k not in lit:
+                    out[k] *= g
+                    self.chase[k] *= g
+            if g < 0.90:
+                self.stats["governor_frames"] += 1
 
-        target_s = self.position_s() + float(delta_s)
-        if self.duration_s is not None:
-            target_s = min(float(self.duration_s), target_s)
-        target_s = max(0.0, target_s)
-        was_paused = self.paused
+        if self.kick_win > 0:
+            self.kick_win -= 1
 
-        try:
-            pygame.mixer.music.play(start=target_s)
-        except Exception:
-            return False
+        levels = [min(255.0, max(0.0, out[k] * gate)) for k in range(4)]
+        active = int(np.argmax(levels))
+        return levels, active
 
-        self.paused = False
-        self._reset_timing(target_s)
-        if was_paused:
-            try:
-                pygame.mixer.music.pause()
-            except Exception:
-                return False
-            self._set_paused_state(True)
-        return True
-
-    def stop(self):
-        if self.backend == "pygame":
-            try:
-                pygame.mixer.music.stop()
-            except Exception:
-                pass
-            return
-
-        if self.proc and self.proc.poll() is None:
-            if os.name != "nt" and self.paused:
-                try:
-                    self.proc.send_signal(signal.SIGCONT)
-                except Exception:
-                    pass
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=1.0)
-            except Exception:
-                self.proc.kill()
-
-    def shutdown(self):
-        self.stop()
-        if self.backend == "pygame" and pygame.mixer.get_init():
-            pygame.mixer.quit()
+    def summary(self) -> dict:
+        s = dict(self.stats)
+        s["pattern_library"] = len(self.library)
+        return s
 
 
 # ---------------------------------------------------------------------------
-# Controller principal
+# Precisão das transições (refino fino + encaixe em compasso)
+# ---------------------------------------------------------------------------
+#
+# O detector estrutural trabalha em janelas de SEG_HOP_SECONDS (≈0,85 s), então
+# o instante que ele devolve já nasce com centenas de ms de erro; depois o
+# encaixe antigo caía na batida mais próxima QUALQUER. Aqui:
+#   1) acha o ponto exato da virada: pico da "novidade fina" (energia, 5 bandas,
+#      densidade e perc/harm: 0,6 s antes vs. depois) numa janela de ±0,9 s;
+#   2) encaixa na batida certa, preferindo o TEMPO 1 do compasso (seções
+#      começam em início de frase);
+#   3) alinha a duração ao grid (fim em batida, de preferência em início de
+#      compasso) sem invadir a transição seguinte.
+# Modifica os TransitionEvent no lugar (a GUI enxerga o resultado) e marca
+# `refined=True` para nunca refinar duas vezes.
+
+def refine_transitions(cfg, fps: int, ma: "MiddleAnalysis", transitions: list, n_frames: int) -> dict:
+    stats = {"refined": 0, "kept": 0, "to_downbeat": 0, "shifts": []}
+    if not transitions or not cfg.TRANS_REFINE_ENABLED:
+        return stats
+
+    transitions.sort(key=lambda t: t.frame_start)
+    nov = ma.novelty
+    nov_med = float(np.median(nov)) + 1e-9
+    bt = ma.beat_times
+    have_grid = len(bt) >= 3
+    S = max(2, int(round(cfg.TRANS_REFINE_SEARCH_S * fps)))
+    min_frames = max(2, int(cfg.TRANS_MIN_DURATION_S * fps))
+    max_frames = max(min_frames + 1, int(cfg.TRANS_MAX_DURATION_S * fps))
+    last = n_frames - 1
+
+    def period_at(f):
+        return float(ma.period[min(max(int(f), 0), ma.n - 1)])
+
+    def best_beat(f, reach, prefer_down, bonus):
+        """índice da batida que minimiza distância (em batidas) com bônus de tempo 1."""
+        k0 = int(np.searchsorted(bt, f))
+        pl = period_at(f)
+        best_k, best_cost = None, 1e9
+        for k in range(max(0, k0 - 3), min(len(bt), k0 + 3)):
+            d = abs(bt[k] - f) / pl
+            if d > reach:
+                continue
+            cost = d - (bonus if (prefer_down and ma.is_downbeat_index(k)) else 0.0)
+            if cost < best_cost:
+                best_cost, best_k = cost, k
+        return best_k
+
+    prev_end = -1
+    for t in transitions:
+        if getattr(t, "refined", False):
+            prev_end = max(prev_end, t.frame_end)
+            stats["kept"] += 1
+            continue
+
+        dur0 = max(2, int(t.frame_end - t.frame_start))
+        c = int(min(max(t.frame_start, 0), last))
+        f = float(c)
+
+        # 1) ponto exato da virada (peso por proximidade ao candidato original)
+        lo, hi = max(1, c - S), min(len(nov) - 2, c + S)
+        if hi > lo:
+            idx = np.arange(lo, hi + 1)
+            score = nov[lo:hi + 1] * (1.0 - 0.35 * np.abs(idx - c) / float(S))
+            k = int(np.argmax(score))
+            if nov[lo + k] >= cfg.TRANS_REFINE_MIN_RATIO * nov_med:
+                f = float(lo + k)
+
+        # 2) encaixe no grid, preferindo início de compasso
+        start = int(round(f))
+        if have_grid:
+            kb = best_beat(f, 0.75, cfg.TRANS_PREFER_DOWNBEAT, 0.6)
+            if kb is not None:
+                start = int(round(bt[kb]))
+                if ma.is_downbeat_index(kb):
+                    stats["to_downbeat"] += 1
+        start = int(min(max(start, 0), last))
+        if start <= prev_end:
+            if have_grid:
+                kk = int(np.searchsorted(bt, prev_end + 1))
+                start = int(round(bt[min(kk, len(bt) - 1)]))
+            else:
+                start = prev_end + 1
+            start = int(min(start, last))
+
+        # 3) duração alinhada ao grid
+        end = start + dur0
+        if have_grid:
+            want = start + dur0
+            pl = period_at(start)
+            best_e, best_cost = None, 1e9
+            k0 = int(np.searchsorted(bt, start + min_frames))
+            for k in range(max(0, k0 - 1), min(len(bt), k0 + 40)):
+                b = int(round(bt[k]))
+                if b < start + min_frames:
+                    continue
+                if b > start + max_frames:
+                    break
+                cost = abs(b - want) / pl - (0.35 if ma.is_downbeat_index(k) else 0.0)
+                if cost < best_cost:
+                    best_cost, best_e = cost, b
+            if best_e is not None:
+                end = best_e
+        end = int(min(max(end, start + 2), last))
+
+        stats["shifts"].append(start - int(t.frame_start))
+        t.frame_start, t.frame_end, t.refined = int(start), int(end), True
+        prev_end = int(end)
+        stats["refined"] += 1
+
+    # nenhuma transição invade a seguinte
+    for a, b in zip(transitions[:-1], transitions[1:]):
+        if a.frame_end > b.frame_start:
+            a.frame_end = max(a.frame_start + 2, b.frame_start)
+            if a.frame_end > b.frame_start:
+                b.frame_start = min(a.frame_end, last)
+                b.frame_end = max(b.frame_end, b.frame_start + 2)
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# Áudio remoto (YouTube) — corrige o HTTP 403 ao alimentar o ffmpeg
+# ---------------------------------------------------------------------------
+#
+# Por que dava 403: a URL "googlevideo" que o yt-dlp devolve é assinada e só
+# funciona com (a) os mesmos headers que o yt-dlp associou ao formato,
+# (b) download em blocos com Range, e (c) formatos que não exijam PO-token /
+# desafio JS. Passar essa URL crua para `ffmpeg -i <url>` quebra em (a), (b)
+# e (c). Aqui a ordem é invertida: o PRÓPRIO yt-dlp baixa o áudio (ele cuida de
+# tudo isso) e o ffmpeg só decodifica um ARQUIVO LOCAL. Se o yt-dlp falhar,
+# há fallbacks em camadas (download em blocos com os headers corretos e, por
+# último, ffmpeg direto na URL com headers + reconexão).
+#
+# Variáveis de ambiente opcionais:
+#   VISIONAUDIO_YT_COOKIES_BROWSER=firefox|chrome|...   (cookies do navegador)
+#   VISIONAUDIO_YT_COOKIES_FILE=/caminho/cookies.txt
+#   VISIONAUDIO_YT_REMOTE_COMPONENTS=1   (permite o yt-dlp baixar o solver JS
+#                                          do GitHub; prefira instalar
+#                                          `pip install -U "yt-dlp[default]"`)
+
+BROWSER_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/126.0.0.0 Safari/537.36"
+)
+
+# Clientes do YouTube tentados em ordem quando o padrão falha com 403.
+_YT_CLIENT_LADDER = (None, ("tv",), ("android_vr",), ("web_safari",), ("mweb",))
+
+YT_HELP_HINT = (
+    "Dicas: (1) atualize o yt-dlp:  pip install -U \"yt-dlp[default]\"  "
+    "(2) instale um runtime JavaScript no PATH (deno ou node) — o YouTube "
+    "exige isso para liberar os formatos de áudio; "
+    "(3) se persistir, exporte VISIONAUDIO_YT_COOKIES_BROWSER=firefox "
+    "(ou chrome) para usar os cookies do navegador."
+)
+
+
+@dataclass
+class RemoteStream:
+    audio_url: str
+    title: str
+    video_url: Optional[str] = None
+    page_url: Optional[str] = None
+    audio_headers: dict = field(default_factory=dict)
+    video_headers: dict = field(default_factory=dict)
+    duration_s: Optional[float] = None
+
+
+@dataclass
+class RemoteAudio:
+    y: np.ndarray
+    sr: int
+    local_path: Optional[str]     # arquivo baixado (None se veio direto por pipe)
+    work_dir: Optional[str]       # pasta temporária (quem chamou deve apagar)
+
+
+_REMOTE_STREAMS: dict = {}
+
+
+def register_stream(stream: RemoteStream):
+    for u in (stream.audio_url, stream.video_url):
+        if u:
+            _REMOTE_STREAMS[u] = stream
+
+
+def lookup_stream(url) -> Optional[RemoteStream]:
+    return _REMOTE_STREAMS.get(url)
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def available_js_runtimes() -> list:
+    return [n for n, exe in (("deno", "deno"), ("node", "node"), ("bun", "bun"), ("quickjs", "qjs"))
+            if shutil.which(exe)]
+
+
+def _ytdlp_options(player_clients=None) -> dict:
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "default_search": "ytsearch1",
+        "retries": 5,
+        "fragment_retries": 5,
+        "extractor_retries": 3,
+        "socket_timeout": 20,
+        # o googlevideo derruba downloads "inteiros"; o yt-dlp baixa em blocos
+        "http_chunk_size": 10 * 1024 * 1024,
+    }
+    runtimes = {name: {} for name in available_js_runtimes()}
+    if runtimes:
+        opts["js_runtimes"] = runtimes
+    if _env_flag("VISIONAUDIO_YT_REMOTE_COMPONENTS"):
+        opts["remote_components"] = ["ejs:github"]
+    browser = os.environ.get("VISIONAUDIO_YT_COOKIES_BROWSER", "").strip()
+    if browser:
+        opts["cookiesfrombrowser"] = (browser,)
+    cookie_file = os.environ.get("VISIONAUDIO_YT_COOKIES_FILE", "").strip()
+    if cookie_file and os.path.isfile(cookie_file):
+        opts["cookiefile"] = cookie_file
+    if player_clients:
+        opts["extractor_args"] = {"youtube": {"player_client": list(player_clients)}}
+    return opts
+
+
+def _short_err(exc: BaseException, limit: int = 220) -> str:
+    msg = " ".join(str(exc).split())
+    msg = msg.replace("ERROR: ", "")
+    return msg if len(msg) <= limit else msg[: limit - 1] + "…"
+
+
+def _import_ytdlp():
+    try:
+        import yt_dlp
+        return yt_dlp
+    except Exception as exc:
+        raise RuntimeError("Biblioteca yt-dlp não encontrada. Instale com: pip install -U yt-dlp") from exc
+
+
+def _pick_info(info):
+    if info and "entries" in info and info["entries"]:
+        info = next((e for e in info["entries"] if e), None)
+    return info
+
+
+def resolve_youtube_stream_info(query_or_url: str) -> RemoteStream:
+    """Resolve título/URLs/headers sem baixar. Tenta vários clientes do YouTube."""
+    yt_dlp = _import_ytdlp()
+    errors = []
+    for clients in _YT_CLIENT_LADDER:
+        opts = _ytdlp_options(clients)
+        opts["format"] = "bestaudio/best"
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = _pick_info(ydl.extract_info(query_or_url, download=False))
+        except Exception as exc:
+            errors.append(f"{'/'.join(clients) if clients else 'padrão'}: {_short_err(exc)}")
+            continue
+        if not info:
+            continue
+
+        formats = info.get("formats") or []
+        stream_url = info.get("url")
+        audio_headers = dict(info.get("http_headers") or {})
+        if not stream_url:
+            audio_only = [
+                f for f in formats
+                if f.get("url") and f.get("acodec") not in (None, "none")
+                and f.get("vcodec") in (None, "none")
+            ]
+            if audio_only:
+                audio_only.sort(key=lambda f: (f.get("abr") or 0.0, f.get("tbr") or 0.0))
+                stream_url = audio_only[-1]["url"]
+                audio_headers = dict(audio_only[-1].get("http_headers") or audio_headers)
+        if not stream_url:
+            errors.append(f"{'/'.join(clients) if clients else 'padrão'}: sem URL de áudio")
+            continue
+
+        av = [f for f in formats if f.get("url")
+              and f.get("acodec") not in (None, "none") and f.get("vcodec") not in (None, "none")]
+        vid = [f for f in formats if f.get("url") and f.get("vcodec") not in (None, "none")]
+        pool = av or vid
+        video_url, video_headers = None, {}
+        if pool:
+            pool.sort(key=lambda f: (f.get("height") or 0.0, f.get("fps") or 0.0,
+                                     1 if f.get("acodec") not in (None, "none") else 0,
+                                     f.get("tbr") or 0.0))
+            video_url = pool[-1]["url"]
+            video_headers = dict(pool[-1].get("http_headers") or {})
+
+        stream = RemoteStream(
+            audio_url=stream_url,
+            title=info.get("title") or "YouTube",
+            video_url=video_url or stream_url,
+            page_url=info.get("webpage_url") or info.get("original_url")
+            or (query_or_url if _is_url_str(query_or_url) else None),
+            audio_headers=audio_headers,
+            video_headers=video_headers or audio_headers,
+            duration_s=float(info["duration"]) if info.get("duration") else None,
+        )
+        register_stream(stream)
+        return stream
+    raise RuntimeError("yt-dlp não conseguiu resolver o vídeo. " + " | ".join(errors) + "\n" + YT_HELP_HINT)
+
+
+def _is_url_str(value) -> bool:
+    return isinstance(value, str) and (value.startswith("http://") or value.startswith("https://"))
+
+
+def _purge_partials(dest_dir: str):
+    for p in glob.glob(os.path.join(dest_dir, "*")):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def _find_downloaded(info, dest_dir: str) -> Optional[str]:
+    info = _pick_info(info) or {}
+    for d in (info.get("requested_downloads") or []):
+        fp = d.get("filepath") or d.get("_filename")
+        if fp and os.path.isfile(fp) and os.path.getsize(fp) > 0:
+            return fp
+    cands = [p for p in glob.glob(os.path.join(dest_dir, "audio.*"))
+             if not p.endswith((".part", ".ytdl", ".temp")) and os.path.getsize(p) > 0]
+    return max(cands, key=os.path.getsize) if cands else None
+
+
+def download_youtube_audio(target: str, dest_dir: str, log=None) -> str:
+    """O yt-dlp baixa o áudio (headers, chunks, cookies e desafios JS por conta dele)."""
+    log = log or (lambda m: None)
+    yt_dlp = _import_ytdlp()
+    errors = []
+    for clients in _YT_CLIENT_LADDER:
+        label = "/".join(clients) if clients else "padrão"
+        opts = _ytdlp_options(clients)
+        opts.update({
+            "format": "bestaudio/best",
+            "outtmpl": os.path.join(dest_dir, "audio.%(ext)s"),
+            "overwrites": True,
+            "noprogress": True,
+        })
+        try:
+            log(f"yt-dlp baixando áudio (cliente: {label})...")
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(target, download=True)
+            path = _find_downloaded(info, dest_dir)
+            if path:
+                return path
+            errors.append(f"{label}: download terminou sem arquivo")
+        except Exception as exc:
+            errors.append(f"{label}: {_short_err(exc)}")
+        _purge_partials(dest_dir)
+    raise RuntimeError(" | ".join(errors))
+
+
+def download_with_ranges(url: str, headers: dict, dest_path: str,
+                         chunk: int = 10 * 1024 * 1024, timeout: float = 25.0) -> str:
+    """Fallback: baixa em blocos com Range e os headers que o yt-dlp associou à URL."""
+    hdrs = {"User-Agent": BROWSER_UA, "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9"}
+    hdrs.update({k: v for k, v in (headers or {}).items() if k.lower() != "range"})
+    pos, total = 0, None
+    with open(dest_path, "wb") as fh:
+        while True:
+            req = urllib.request.Request(url, headers={**hdrs, "Range": f"bytes={pos}-{pos + chunk - 1}"})
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    data = resp.read()
+                    status = resp.status
+                    content_range = resp.headers.get("Content-Range", "")
+            except urllib.error.HTTPError as exc:
+                if exc.code == 416 and pos > 0:
+                    break
+                raise RuntimeError(f"HTTP {exc.code} ao baixar bloco em {pos} bytes") from exc
+            if not data:
+                break
+            fh.write(data)
+            pos += len(data)
+            if status == 200:           # servidor ignorou Range e mandou tudo
+                break
+            tail = content_range.rsplit("/", 1)[-1]
+            if tail.isdigit():
+                total = int(tail)
+            if (total is not None and pos >= total) or (total is None and len(data) < chunk):
+                break
+    if pos <= 0:
+        raise RuntimeError("download em blocos retornou 0 bytes")
+    return dest_path
+
+
+def _ffmpeg_http_args(headers: Optional[dict]) -> list:
+    headers = dict(headers or {})
+    ua = BROWSER_UA
+    for k in list(headers):
+        if k.lower() == "user-agent":
+            ua = headers.pop(k)
+    args = ["-user_agent", ua]
+    if headers:
+        args += ["-headers", "".join(f"{k}: {v}\r\n" for k, v in headers.items())]
+    args += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
+    return args
+
+
+def ffmpeg_decode_mono_pcm(source: str, target_sr: int, headers: Optional[dict] = None) -> np.ndarray:
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffmpeg_bin:
+        raise RuntimeError("ffmpeg não encontrado.")
+    cmd = [ffmpeg_bin, "-nostdin", "-hide_banner", "-loglevel", "error"]
+    if _is_url_str(source):
+        cmd += _ffmpeg_http_args(headers)
+    cmd += ["-i", source, "-vn", "-ac", "1", "-ar", str(int(target_sr)),
+            "-f", "s16le", "-acodec", "pcm_s16le", "pipe:1"]
+    result = subprocess.run(cmd, capture_output=True, check=False)
+    if result.returncode != 0:
+        err = result.stderr.decode(errors="ignore").strip()
+        raise RuntimeError(f"falha ao decodificar: {err[-300:]}")
+    pcm = np.frombuffer(result.stdout, dtype=np.int16)
+    if pcm.size == 0:
+        raise RuntimeError("áudio decodificado vazio")
+    return pcm.astype(np.float32) / 32768.0
+
+
+def make_playback_wav(local_audio_path: str, dest_path: str) -> str:
+    """WAV 44,1 kHz estéreo para tocar (melhor que o WAV mono 22 kHz da análise)."""
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffmpeg_bin:
+        raise RuntimeError("ffmpeg não encontrado.")
+    cmd = [ffmpeg_bin, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+           "-i", local_audio_path, "-vn", "-ac", "2", "-ar", "44100",
+           "-acodec", "pcm_s16le", dest_path]
+    result = subprocess.run(cmd, capture_output=True, check=False)
+    if result.returncode != 0 or not os.path.isfile(dest_path) or os.path.getsize(dest_path) < 1024:
+        raise RuntimeError(result.stderr.decode(errors="ignore").strip()[-200:] or "wav vazio")
+    return dest_path
+
+
+def load_remote_audio(source: str, target_sr: int = 22050, work_dir: Optional[str] = None,
+                      log=None) -> RemoteAudio:
+    """Obtém o áudio de uma URL remota sem tomar 403.
+
+    Ordem: (1) yt-dlp baixa → ffmpeg decodifica arquivo local;
+           (2) download em blocos com headers corretos → ffmpeg local;
+           (3) ffmpeg direto na URL com headers + reconexão.
+    """
+    log = log or (lambda m: None)
+    own_dir = work_dir is None
+    if own_dir:
+        work_dir = tempfile.mkdtemp(prefix="ledsync_remote_")
+    stream = lookup_stream(source)
+    errors = []
+
+    attempts = []
+    if stream and stream.page_url:
+        attempts.append(("yt-dlp", lambda: download_youtube_audio(stream.page_url, work_dir, log)))
+    attempts.append((
+        "download em blocos",
+        lambda: download_with_ranges(
+            source, stream.audio_headers if stream else {}, os.path.join(work_dir, "audio_direct.bin")
+        ),
+    ))
+    for name, fn in attempts:
+        try:
+            local = fn()
+            y = ffmpeg_decode_mono_pcm(local, target_sr)
+            return RemoteAudio(y=y, sr=target_sr, local_path=local, work_dir=work_dir)
+        except Exception as exc:
+            errors.append(f"{name}: {_short_err(exc)}")
+            log(f"{name} falhou: {_short_err(exc, 120)}")
+            if name == "yt-dlp":
+                _purge_partials(work_dir)
+
+    try:
+        log("tentando ffmpeg direto na URL (com headers)...")
+        y = ffmpeg_decode_mono_pcm(source, target_sr, headers=stream.audio_headers if stream else None)
+        return RemoteAudio(y=y, sr=target_sr, local_path=None, work_dir=work_dir)
+    except Exception as exc:
+        errors.append(f"ffmpeg direto: {_short_err(exc)}")
+
+    if own_dir:
+        shutil.rmtree(work_dir, ignore_errors=True)
+    raise RuntimeError("Não foi possível obter o áudio remoto.\n  - " + "\n  - ".join(errors) + "\n" + YT_HELP_HINT)
+
+
+# ---------------------------------------------------------------------------
+# Motor principal
 # ---------------------------------------------------------------------------
 
-class MusicLEDController:
-    def __init__(
-        self,
-        port="/dev/ttyACM0",
-        baudrate=115200,
-        fps=None,
-        config=None,
-        middle_bpm_multiplier=1.0,
-        show_youtube_video=False,
-    ):
-        self.port      = port
-        self.baudrate  = baudrate
-        self.config    = config or EffectConfig()
-        self.fps       = self.config.FPS if fps is None else int(fps)
+@dataclass
+class ScoreResult:
+    """Partitura completa de uma faixa."""
+    led_patterns: list          # [(modo, np.ndarray[6] PWM)] por frame
+    dominant_leds: list         # LED dominante (1..4) por frame
+    transitions: list           # list[TransitionEvent] (já refinadas)
+    tempo_bpm: float
+    beat_frames: list           # batidas, em frames
+    n_frames: int
+    report: dict                # métricas do motor (para a interface)
+    report_lines: list          # o mesmo, em texto
+
+
+class LedScoreEngine:
+    """Transforma áudio em uma partitura de PWM (6 LEDs) — 100% offline."""
+
+    def __init__(self, fps=None, config=None, middle_bpm_multiplier=1.0, log_callback=None):
+        self.config = config or EffectConfig()
+        self.fps = self.config.FPS if fps is None else int(fps)
         try:
             speed_mult = float(middle_bpm_multiplier)
         except Exception:
@@ -679,72 +1722,27 @@ class MusicLEDController:
         if not np.isfinite(speed_mult) or speed_mult <= 0.0:
             speed_mult = 1.0
         self.middle_bpm_multiplier = speed_mult
-        self.show_youtube_video = bool(show_youtube_video)
-        self.ser       = None
-        self.playing   = False
-        self._temp_playback_files = set()
+        self.log_callback = log_callback
+        self.report = {}
+        self.report_lines = []
+        self._progress_cb = None
 
     # ------------------------------------------------------------------ #
-    # Serial                                                               #
+    # Utilidades                                                           #
     # ------------------------------------------------------------------ #
 
-    def connect_arduino(self):
-        try:
-            self.ser = serial.Serial(self.port, self.baudrate, timeout=1)
-            time.sleep(2)
-            log_ok(f"Conectado ao Arduino em {_c(self.port, C.BYELLOW)}")
-            if self.ser.in_waiting:
-                log_sub(self.ser.readline().decode(errors="ignore").strip())
-            return True
-        except Exception as exc:
-            log_err(f"Erro ao conectar ao Arduino: {exc}")
-            log_sub("Verifique a porta serial e se o Arduino está conectado")
-            return False
+    def _note(self, message):
+        self.report_lines.append(message)
+        if self.log_callback:
+            self.log_callback(message)
 
-    def send_led_command(self, led_values, mode=1):
-        if not (self.ser and self.ser.is_open):
-            return
-        # FIX #8: serial.write sem try/except causava crash ao desconectar o Arduino.
-        try:
-            num_leds = self.config.NUM_LEDS
-            values   = np.zeros(num_leds, dtype=np.int32)
-            src      = np.asarray(led_values, dtype=np.int32)
-            n        = min(num_leds, src.shape[0])
-            values[:n] = src[:n]
-            payload  = ",".join(str(int(v)) for v in values)
-            self.ser.write(f"P,{int(mode)},{payload}\n".encode())
-        except serial.SerialException:
-            pass  # Não interrompe o loop de playback
-
-    def disconnect(self):
-        if self.ser and self.ser.is_open:
-            self.send_led_command([0] * self.config.NUM_LEDS, mode=1)
-            self.ser.close()
-            log_ok("Desconectado do Arduino")
-
-    # ------------------------------------------------------------------ #
-    # Helpers                                                              #
-    # ------------------------------------------------------------------ #
+    def _progress(self, fraction, label):
+        if self._progress_cb:
+            self._progress_cb(float(min(1.0, max(0.0, fraction))), label)
 
     @staticmethod
     def _ema(prev, value, alpha):
         return alpha * value + (1.0 - alpha) * prev
-
-    @staticmethod
-    def _sequence_step_focus(step):
-        if not step:
-            return 0.0
-        return float(sum(step)) / float(len(step))
-
-    @staticmethod
-    def _sequence_step_equals(step_a, step_b):
-        return tuple(step_a) == tuple(step_b)
-
-    @staticmethod
-    def _is_url(value):
-        return isinstance(value, str) and (
-            value.startswith("http://") or value.startswith("https://")
-        )
 
     @staticmethod
     def _window_mean(arr, lo, hi):
@@ -855,49 +1853,47 @@ class MusicLEDController:
     # Carregamento de áudio                                                #
     # ------------------------------------------------------------------ #
 
-    def _load_audio_data(self, audio_source, target_sr=22050):
-        if self._is_url(audio_source):
-            ffmpeg_bin = shutil.which("ffmpeg")
-            if not ffmpeg_bin:
-                raise RuntimeError("ffmpeg não encontrado.")
-            cmd = [
-                ffmpeg_bin, "-nostdin", "-hide_banner", "-loglevel", "error",
-                "-i", audio_source, "-vn", "-ac", "1", "-ar", str(target_sr),
-                "-f", "s16le", "-acodec", "pcm_s16le", "pipe:1",
-            ]
-            result = subprocess.run(cmd, capture_output=True, check=False)
-            if result.returncode != 0:
-                err = result.stderr.decode(errors="ignore").strip()
-                raise RuntimeError(f"falha ao decodificar stream: {err}")
-            pcm = np.frombuffer(result.stdout, dtype=np.int16)
-            if pcm.size == 0:
-                raise RuntimeError("stream sem áudio decodificado")
-            y = pcm.astype(np.float32) / 32768.0
-            return y, target_sr, float(len(y)) / float(target_sr)
+    # ------------------------------------------------------------------ #
+    # Ponto de entrada                                                     #
+    # ------------------------------------------------------------------ #
 
-        y, sr = librosa.load(audio_source, sr=target_sr, mono=True)
-        return y, sr, librosa.get_duration(y=y, sr=sr)
+    def compute_score(self, y, sr, progress_cb=None):
+        """Beats → estrutura → transições → partitura. `progress_cb(fração, rótulo)`."""
+        self._progress_cb = progress_cb
+        self.report_lines = []
+        self.report = {}
+        n_frames = max(1, int(len(y) / float(sr) * self.fps))
 
-    def _create_temp_wav_from_audio(self, y, sr):
-        fd, path = tempfile.mkstemp(prefix="ledsync_", suffix=".wav")
-        os.close(fd)
-        pcm = (np.clip(y, -1.0, 1.0) * 32767).astype(np.int16)
-        with wave.open(path, "wb") as wavf:
-            wavf.setnchannels(1)
-            wavf.setsampwidth(2)
-            wavf.setframerate(int(sr))
-            wavf.writeframes(pcm.tobytes())
-        self._temp_playback_files.add(path)
-        return path
+        self._progress(0.02, "Calculando BPM...")
+        tempo, beat_times = librosa.beat.beat_track(y=y, sr=sr)
+        try:
+            tempo_bpm = float(np.asarray(tempo).reshape(-1)[0])
+        except Exception:
+            tempo_bpm = 120.0
+        if not math.isfinite(tempo_bpm) or tempo_bpm <= 1.0:
+            tempo_bpm = 120.0
+        beat_frames = (librosa.frames_to_time(beat_times, sr=sr) * self.fps).astype(np.int32)
 
-    def _cleanup_temp_playback_files(self):
-        for path in list(self._temp_playback_files):
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-            finally:
-                self._temp_playback_files.discard(path)
+        self._progress(0.10, "Detectando estrutura e transições...")
+        transitions = self._analyze_structure(y, sr)
+        transitions = self._snap_to_beats(
+            transitions, beat_frames, tempo_bpm, self.fps, self.config, n_frames
+        )
+
+        led_patterns, dominant_leds = self._generate_led_score(
+            y, sr, n_frames, transitions, tempo_bpm, beat_frames
+        )
+        self._progress_cb = None
+        return ScoreResult(
+            led_patterns=led_patterns,
+            dominant_leds=dominant_leds,
+            transitions=transitions,
+            tempo_bpm=tempo_bpm,
+            beat_frames=[int(b) for b in beat_frames],
+            n_frames=n_frames,
+            report=dict(self.report),
+            report_lines=list(self.report_lines),
+        )
 
     # ------------------------------------------------------------------ #
     # FASE 1 — Análise estrutural completa da música                       #
@@ -905,12 +1901,12 @@ class MusicLEDController:
 
     def _analyze_structure(self, y: np.ndarray, sr: int) -> list:
         cfg = self.config
-        log_sub("Separando harmônico/percussivo (HPSS)...")
+        self._note("Separando harmônico/percussivo (HPSS)...")
         y_harm, y_perc = librosa.effects.hpss(y, margin=3.0)
 
         hop_samples = int(cfg.SEG_HOP_SECONDS * sr)
 
-        log_sub("Calculando features espectrais por janela...")
+        self._note("Calculando features espectrais por janela...")
 
         mfcc   = librosa.feature.mfcc(y=y_harm, sr=sr, n_mfcc=13, hop_length=hop_samples)
         chroma = librosa.feature.chroma_cqt(y=y_harm, sr=sr, hop_length=hop_samples)
@@ -957,7 +1953,7 @@ class MusicLEDController:
         chroma_norm = librosa.util.normalize(chroma, axis=0)
         feat_matrix = np.vstack([mfcc_norm, chroma_norm])  # (25, n_win)
 
-        log_sub("Segmentação aglomerativa...")
+        self._note("Segmentação aglomerativa...")
 
         k = min(cfg.SEG_K_SEGMENTS, max(2, n_win // 4))
         try:
@@ -1025,9 +2021,7 @@ class MusicLEDController:
             )
             last_accepted_time = b_time
 
-        log_sub(
-            f"{_c(len(valid_boundaries), C.BYELLOW, C.BOLD)} fronteiras de seção detectadas"
-        )
+        self._note(f"{len(valid_boundaries)} fronteiras de seção detectadas")
 
         p90_perc = float(np.percentile(rms_perc, 90)) + 1e-9
         p90_rms  = float(np.percentile(rms_total, 90)) + 1e-9
@@ -1064,14 +2058,10 @@ class MusicLEDController:
 
             # Rejeita fronteiras onde o trecho seguinte tem energia irrisória
             if beat_norm_after + kick_mean_after < cfg.SEG_MIN_ENERGY_THRESHOLD:
-                icon_skip = _c("✗", C.DIM)
-                log_sub(
-                    f"t={_c(f'{b_time:6.2f}s', C.DIM)}  {icon_skip}  "
-                    f"{_c('ignorada (silêncio)', C.DIM)}"
-                    f"  beat={_c(f'{beat_norm_after:.2f}', C.DIM)}"
-                    f"  kick={_c(f'{kick_mean_after:.2f}', C.DIM)}"
-                    f"  Δ={_c(f'{struct_delta:.2f}', C.DIM)}"
-                    f"  Δp={_c(f'{persist_delta:.2f}', C.DIM)}"
+                self._note(
+                    f"t={b_time:6.2f}s  ignorada (silêncio)"
+                    f"  beat={beat_norm_after:.2f}  kick={kick_mean_after:.2f}"
+                    f"  Δ={struct_delta:.2f}  Δp={persist_delta:.2f}"
                 )
                 continue
 
@@ -1111,21 +2101,12 @@ class MusicLEDController:
                 kick_mean_after = kick_mean_after,
             ))
 
-            icon, color = _EFFECT_ICONS[eff_type]
-            short_tag = (
-                _c("  curta✓", C.BMAGENTA, C.BOLD) if is_short_change else ""
-            )
-            log_sub(
-                f"t={_c(f'{b_time:6.2f}s', C.BYELLOW)}  "
-                f"{_c(icon, color)}  {_c(f'{eff_type.name:<14}', color, C.BOLD)}"
-                f"  beat={_c(f'{beat_norm_after:.2f}', C.BCYAN)}"
-                f"  kick={_c(f'{kick_mean_after:.2f}', C.BMAGENTA)}"
-                f"  Δ={_c(f'{struct_delta:.2f}', C.BBLUE)}"
-                f"  Δp={_c(f'{persist_delta:.2f}', C.BCYAN)}"
-                f"  pers={_c(f'{persist_ratio:.2f}', C.BCYAN)}"
-                f"{short_tag}"
-                f"  flat={_c(f'{flat_aft:.2f}', C.DIM)}"
-                f"  dur={_c(f'{dur_s:.2f}s', C.DIM)}"
+            self._note(
+                f"t={b_time:6.2f}s  {eff_type.name:<14}"
+                f"  beat={beat_norm_after:.2f}  kick={kick_mean_after:.2f}"
+                f"  Δ={struct_delta:.2f}  Δp={persist_delta:.2f}  pers={persist_ratio:.2f}"
+                f"{'  curta' if is_short_change else ''}"
+                f"  flat={flat_aft:.2f}  dur={dur_s:.2f}s"
             )
 
         return transitions
@@ -1352,47 +2333,34 @@ class MusicLEDController:
         pcm_bytes = pcm.tobytes()
 
         # FIX #4: freqs/low_mask/high_mask são constantes — pré-computar uma vez.
-        # No original eram recalculadas em cada um dos 5000+ frames do loop.
         freqs     = np.fft.rfftfreq(samples_per_frame, 1.0 / sr)
         low_mask  = (freqs >= cfg.LOW_BAND_MIN_HZ) & (freqs <= cfg.LOW_BAND_MAX_HZ)
         high_mask = (freqs >= 2000.0)              & (freqs <= 8000.0)
         _has_low  = bool(np.any(low_mask))
         _has_high = bool(np.any(high_mask))
 
-        middle_tempo_bpm = tempo_bpm * self.middle_bpm_multiplier
-        if not np.isfinite(middle_tempo_bpm) or middle_tempo_bpm <= 1.0:
-            middle_tempo_bpm = tempo_bpm
-
-        base_step_frames = int(np.clip(
-            round((60.0 / middle_tempo_bpm) * self.fps * cfg.BPM_STEP_MULT),
-            cfg.STEP_FRAMES_MIN, cfg.STEP_FRAMES_MAX,
-        ))
-        base_speed = 1.0 / float(base_step_frames)
+        # ---- LEDs do meio: análise offline + renderizador adaptativo ---- #
+        self._progress(0.42, "Analisando ataques, compasso, seções e drops...")
+        mid_analysis = MiddleAnalyzer(cfg, self.fps).analyze(
+            y, sr, n_frames, tempo_bpm, beat_frames
+        )
+        # precisão das transições: ponto exato da virada + encaixe no compasso
+        refine_stats = refine_transitions(cfg, self.fps, mid_analysis, transitions, n_frames)
+        mid_renderer = MiddleRenderer(
+            cfg, self.fps, mid_analysis, self.middle_bpm_multiplier, n_frames,
+            section_frames=[t.frame_start for t in transitions],
+        )
+        trans_energy_ref = 1.0
+        middle_leds = np.array([1, 2, 3, 4], dtype=np.int32)
 
         trans_index  = 0
         n_trans      = len(transitions)
         active_trans = None   # TransitionEvent | None
+        trans_just_ended = False
 
-        middle_leds         = np.array([1, 2, 3, 4], dtype=np.int32)
-        middle_sequences    = cfg.MIDDLE_SEQUENCES
-        sequence_idx        = 0
-        current_sequence    = middle_sequences[sequence_idx]
-        sequence_step_idx   = 0
-        sequence_loop_count = 0
-        active_step         = current_sequence[sequence_step_idx]
-        active_mid          = int(round(self._sequence_step_focus(active_step)))
-        phase_accumulator   = 0.0
-
-        middle_levels = np.zeros(4, dtype=np.float32)
+        # ---- estado das PONTAS (inalterado) ----------------------------- #
         edge_levels   = np.zeros(2, dtype=np.float32)
 
-        prev_spectrum      = None
-        ema_rms_fast       = 0.0
-        ema_rms_slow       = 0.0
-        ema_flux_fast      = 0.0
-        ema_flux_slow      = 0.0
-
-        energy_window   = deque(maxlen=max(4, int(self.fps * 2)))
         low_band_window = deque(maxlen=max(4, int(self.fps * 1.2)))
 
         prev_kick_strength = 0.0
@@ -1410,51 +2378,8 @@ class MusicLEDController:
         led_patterns  = []
         dominant_leds = []
 
-        # FIX #5: variáveis de cache para percentil (atualizado a cada 10 frames)
-        p90_energy = 1e-9
+        # FIX #5: cache do percentil (atualizado a cada 10 frames)
         p95_low    = 1e-9
-
-        # ---- BPM resync: grid rítmico para steps do meio ---------------- #
-        # Converte beat_times → beat_frame_indices no espaço da partitura
-        beat_frame_set = set(int(np.clip(bf, 0, n_frames - 1)) for bf in beat_frames)
-        beat_frame_sorted = sorted(beat_frame_set)
-        _bf_len = len(beat_frame_sorted)
-        grid_anchor_frame = beat_frame_sorted[0] if _bf_len > 0 else 0
-        track_seconds = max(n_frames / float(self.fps), 1e-6)
-        expected_beats = max(1.0, track_seconds * max(tempo_bpm, 1.0) / 60.0)
-        beat_coverage = float(np.clip(_bf_len / expected_beats, 0.0, 1.6))
-        cont_sync_strength = float(np.clip(
-            cfg.BPM_CONTINUOUS_SYNC_STRENGTH * (0.65 + 0.90 * beat_coverage),
-            0.015, 0.14,
-        ))
-        resync_strength = float(np.clip(
-            cfg.BPM_RESYNC_STRENGTH * (0.70 + 0.35 * beat_coverage),
-            0.35, 0.98,
-        ))
-        log_sub(
-            "Sync automático: "
-            f"cont={_c(f'{cont_sync_strength:.3f}', C.BCYAN)}  "
-            f"pós={_c(f'{resync_strength:.3f}', C.BCYAN)}  "
-            f"cobertura={_c(f'{beat_coverage:.2f}', C.BYELLOW)}"
-        )
-
-        def _next_grid_phase(current_frame: int) -> float:
-            """Retorna a fase [0,1) que o phase_accumulator deveria ter
-               para disparar o próximo step alinhado ao grid da batida."""
-            if _bf_len == 0 or base_step_frames <= 1:
-                return phase_accumulator
-            if current_frame <= grid_anchor_frame:
-                frames_to_grid = grid_anchor_frame - current_frame
-            else:
-                frames_from_anchor = (current_frame - grid_anchor_frame) % base_step_frames
-                frames_to_grid = (
-                    0 if frames_from_anchor == 0 else (base_step_frames - frames_from_anchor)
-                )
-            ideal = float(np.clip(1.0 - frames_to_grid * base_speed, 0.0, 1.0))
-            return ideal
-
-        if _bf_len > 0:
-            phase_accumulator = _next_grid_phase(0)
 
         for i in range(n_frames):
             # ---- áudio deste frame ----------------------------------- #
@@ -1467,30 +2392,16 @@ class MusicLEDController:
                 frame = np.pad(frame, (0, samples_per_frame - len(frame)))
             frame = frame / 32768.0
 
-            rms      = float(np.sqrt(np.mean(frame * frame) + 1e-12))
             spectrum = np.abs(np.fft.rfft(frame))
-            # FIX #4: usa masks pré-computadas (freqs, low_mask, high_mask já calculadas)
             low_band_energy  = float(np.mean(spectrum[low_mask]))  if _has_low  else 0.0
             high_band_energy = float(np.mean(spectrum[high_mask])) if _has_high else 0.0
 
-            flux = 0.0 if prev_spectrum is None else float(
-                np.mean(np.maximum(spectrum - prev_spectrum, 0.0))
-            )
-            prev_spectrum = spectrum
-
             if i == 0:
-                ema_rms_fast = rms;   ema_rms_slow  = rms
-                ema_flux_fast = flux; ema_flux_slow  = flux
                 low_fast = low_band_energy; low_slow = low_band_energy
             else:
-                ema_rms_fast  = self._ema(ema_rms_fast,  rms,  cfg.RMS_FAST_ALPHA)
-                ema_rms_slow  = self._ema(ema_rms_slow,  rms,  cfg.RMS_SLOW_ALPHA)
-                ema_flux_fast = self._ema(ema_flux_fast, flux, cfg.FLUX_FAST_ALPHA)
-                ema_flux_slow = self._ema(ema_flux_slow, flux, cfg.FLUX_SLOW_ALPHA)
                 low_fast = self._ema(low_fast, low_band_energy, cfg.LOW_FAST_ALPHA)
                 low_slow = self._ema(low_slow, low_band_energy, cfg.LOW_SLOW_ALPHA)
 
-            beat_norm     = float(np.clip((ema_rms_fast - ema_rms_slow) * 12.0, 0.0, 1.0))
             kick_strength = float(np.clip((low_fast - low_slow) * cfg.KICK_GAIN, 0.0, 1.0))
 
             if kick_cooldown_left > 0:
@@ -1504,14 +2415,10 @@ class MusicLEDController:
                 kick_window_left   = kick_window_frames
                 kick_cooldown_left = cfg.KICK_COOLDOWN_FRAMES
 
-            energy_window.append(rms)
             low_band_window.append(low_band_energy)
 
-            # FIX #5: percentile em cache — atualiza a cada 10 frames (era todo frame, O(n log n)).
             if i % 10 == 0:
-                p90_energy = float(np.percentile(np.array(energy_window), 90)) + 1e-9
-                p95_low    = float(np.percentile(np.array(low_band_window), 95)) + 1e-9
-            norm_energy = float(np.clip(rms / p90_energy, 0.0, 1.0))
+                p95_low = float(np.percentile(np.array(low_band_window), 95)) + 1e-9
             low_norm    = float(np.clip(low_band_energy / p95_low, 0.0, 1.0))
 
             startup_factor = float(np.clip((i + 1) / startup_frames, 0.0, 1.0))
@@ -1520,127 +2427,7 @@ class MusicLEDController:
             if kick_window_left > 0:
                 kick_window_left -= 1
 
-            # ---- avança sequência do meio (sempre, mesmo em transição) #
-            phase_accumulator += base_speed
-            if (
-                active_trans is None
-                and cont_sync_strength > 0.0
-                and _bf_len > 0
-            ):
-                ideal = _next_grid_phase(i)
-                phase_accumulator = (
-                    phase_accumulator * (1.0 - cont_sync_strength)
-                    + ideal * cont_sync_strength
-                )
-            while phase_accumulator >= 1.0:
-                phase_accumulator -= 1.0
-                prev_active_mid  = active_mid
-                prev_active_step = active_step
-                sequence_step_idx += 1
-
-                if sequence_step_idx >= len(current_sequence):
-                    sequence_step_idx   = 0
-                    sequence_loop_count += 1
-
-                    if sequence_loop_count >= cfg.MIDDLE_SEQ_SWITCH_REPEATS:
-                        sequence_idx        = (sequence_idx + 1) % len(middle_sequences)
-                        current_sequence    = middle_sequences[sequence_idx]
-                        sequence_loop_count = 0
-                        candidate = min(
-                            range(len(current_sequence)),
-                            key=lambda idx: abs(
-                                self._sequence_step_focus(current_sequence[idx])
-                                - prev_active_mid
-                            ),
-                        )
-                        if (
-                            len(current_sequence) > 1
-                            and self._sequence_step_equals(
-                                current_sequence[candidate], prev_active_step
-                            )
-                        ):
-                            candidate = (candidate + 1) % len(current_sequence)
-                        sequence_step_idx = candidate
-
-                active_step = current_sequence[sequence_step_idx]
-                active_mid  = int(round(self._sequence_step_focus(active_step)))
-
-            # ---- transição agendada ----------------------------------- #
-            if active_trans is None and trans_index < n_trans:
-                if i >= transitions[trans_index].frame_start:
-                    active_trans = transitions[trans_index]
-                    trans_index += 1
-
-            # ---- LEDs do meio ---------------------------------------- #
-            if active_trans is not None:
-                local_frame  = i - active_trans.frame_start
-                total_frames = active_trans.frame_end - active_trans.frame_start
-                progress     = float(np.clip(
-                    local_frame / max(1, total_frames - 1), 0.0, 1.0
-                ))
-
-                effect_levels = self._render_transition_frame(
-                    effect_type    = active_trans.effect_type,
-                    progress       = progress,
-                    beat_norm      = active_trans.beat_norm_after,
-                    kick_strength  = active_trans.kick_mean_after,
-                    pwm_brightness = active_trans.pwm_brightness * startup_gain,
-                )
-
-                bf = cfg.TRANS_BLEND_FRAMES
-                if local_frame < bf:
-                    alpha = float(local_frame) / float(bf)
-                elif local_frame > total_frames - bf:
-                    alpha = float(total_frames - local_frame) / float(max(1, bf))
-                else:
-                    alpha = 1.0
-                alpha = float(np.clip(alpha, 0.0, 1.0))
-
-                middle_levels *= cfg.MIDDLE_FADE_DECAY
-                middle_levels  = middle_levels * (1.0 - alpha) + effect_levels * alpha
-
-                if i >= active_trans.frame_end:
-                    active_trans  = None
-                    middle_levels *= 0.55
-                    # ---- ressincroniza fase ao grid de batidas -------- #
-                    if resync_strength > 0.0 and _bf_len > 0:
-                        ideal = _next_grid_phase(i)
-                        phase_accumulator = (
-                            phase_accumulator * (1.0 - resync_strength)
-                            + ideal * resync_strength
-                        )
-
-            else:
-                # ---- sequência normal -------------------------------- #
-                middle_levels *= cfg.MIDDLE_FADE_DECAY
-
-                active_pwm = (
-                    cfg.ACTIVE_MIN_PWM
-                    + (cfg.ACTIVE_MAX_PWM - cfg.ACTIVE_MIN_PWM) * norm_energy
-                    + cfg.BEAT_BOOST_PWM * beat_norm
-                )
-                if beat_norm > cfg.HEAVY_BEAT_THRESHOLD:
-                    active_pwm += 25.0 * (
-                        beat_norm - cfg.HEAVY_BEAT_THRESHOLD
-                    ) / (1.0 - cfg.HEAVY_BEAT_THRESHOLD)
-                active_pwm += cfg.MIDDLE_KICK_BRIGHT_GAIN * kick_strength
-                if kick_strength > 0.7:
-                    active_pwm += cfg.MIDDLE_STRONG_KICK_BRIGHT_GAIN * (
-                        (kick_strength - 0.7) / 0.3
-                    )
-                if kick_window_left > 0:
-                    active_pwm += cfg.MIDDLE_KICK_WINDOW_BRIGHT_GAIN * (
-                        0.4 + 0.6 * kick_strength
-                    )
-                active_pwm = float(np.clip(
-                    active_pwm * startup_gain,
-                    cfg.ACTIVE_MIN_PWM * 0.45,
-                    cfg.ACTIVE_MAX_PWM,
-                ))
-                for mid_idx in active_step:
-                    middle_levels[mid_idx] = max(middle_levels[mid_idx], active_pwm)
-
-            # ---- pontas ---------------------------------------------- #
+            # ---- pontas (lógica inalterada) -------------------------- #
             low_ratio    = low_band_energy / (high_band_energy + 1e-9)
             low_attack   = max(0.0, low_norm - prev_low_norm)
             edge_drive   = float(np.clip(
@@ -1692,21 +2479,75 @@ class MusicLEDController:
                 edge_pulse   = 0.0
 
             edge_pulse *= startup_gain
-            if edge_pulse >= cfg.EDGE_SYNC_MIN_PWM:
-                sync_strength = float(np.clip(edge_pulse / 255.0, 0.0, 1.0))
-                if active_trans is None:
-                    for mid_idx in active_step:
-                        middle_levels[mid_idx] = min(
-                            255.0,
-                            middle_levels[mid_idx]
-                            + cfg.MIDDLE_EDGE_SYNC_GAIN * sync_strength,
-                        )
             if edge_pulse > 1.0:
                 edge_levels[0] = max(edge_levels[0], edge_pulse)
                 edge_levels[1] = max(edge_levels[1], edge_pulse)
 
             prev_kick_strength = kick_strength
             prev_low_norm      = low_norm
+
+            # ---- transição agendada ----------------------------------- #
+            if active_trans is None and trans_index < n_trans:
+                if i >= transitions[trans_index].frame_start:
+                    active_trans = transitions[trans_index]
+                    trans_index += 1
+                    span = mid_analysis.energy[
+                        active_trans.frame_start:max(active_trans.frame_start + 1, active_trans.frame_end)
+                    ]
+                    trans_energy_ref = float(np.mean(span)) if len(span) else 1.0
+
+            # ---- LEDs do meio ---------------------------------------- #
+            # O motor roda SEMPRE (mesmo durante transições): assim o relógio
+            # dos passos, o estado dos padrões e o AGC continuam coerentes e
+            # a saída da transição não dá "salto".
+            under_levels, active_mid = mid_renderer.frame(
+                i,
+                startup_gain     = startup_gain,
+                edge_pulse       = edge_pulse,
+                trans_active     = active_trans is not None,
+                trans_just_ended = trans_just_ended,
+            )
+            trans_just_ended = False
+            middle_levels = np.asarray(under_levels, dtype=np.float32)
+
+            if active_trans is not None:
+                local_frame  = i - active_trans.frame_start
+                total_frames = active_trans.frame_end - active_trans.frame_start
+                progress     = float(np.clip(
+                    local_frame / max(1, total_frames - 1), 0.0, 1.0
+                ))
+
+                # o efeito respira com a energia ao vivo da música
+                live_ratio = float(np.clip(
+                    mid_analysis.energy[min(i, n_frames - 1)] / (trans_energy_ref + 1e-6), 0.5, 1.3
+                ))
+                live_gain = (1.0 - cfg.TRANS_LIVE_GAIN) + cfg.TRANS_LIVE_GAIN * live_ratio
+
+                effect_levels = self._render_transition_frame(
+                    effect_type    = active_trans.effect_type,
+                    progress       = progress,
+                    beat_norm      = active_trans.beat_norm_after,
+                    kick_strength  = active_trans.kick_mean_after,
+                    pwm_brightness = min(235.0, active_trans.pwm_brightness * startup_gain * live_gain),
+                )
+
+                # rampa de entrada/saída em frações de batida (não em frames fixos)
+                beat_frames_now = float(mid_analysis.period[min(i, n_frames - 1)])
+                bf = max(2, min(int(cfg.TRANS_BLEND_FRAMES), int(round(0.5 * beat_frames_now))))
+                if local_frame < bf:
+                    alpha = float(local_frame) / float(bf)
+                elif local_frame > total_frames - bf:
+                    alpha = float(total_frames - local_frame) / float(max(1, bf))
+                else:
+                    alpha = 1.0
+                alpha = float(np.clip(alpha, 0.0, 1.0))
+
+                middle_levels = middle_levels * (1.0 - alpha) + effect_levels * alpha
+                active_mid = int(np.argmax(middle_levels))
+
+                if i >= active_trans.frame_end:
+                    active_trans     = None
+                    trans_just_ended = True
 
             # ---- monta frame ----------------------------------------- #
             pwm = np.zeros(cfg.NUM_LEDS, dtype=np.float32)
@@ -1721,740 +2562,49 @@ class MusicLEDController:
             dominant_leds.append(int(middle_leds[active_mid]))
 
             if (i + 1) % 150 == 0 or i == n_frames - 1:
-                progress_bar(i + 1, n_frames, label=f"{i+1}/{n_frames} frames")
+                self._progress(0.55 + 0.45 * (i + 1) / n_frames, "Gerando LEDs...")
 
-        print()
+        self._build_report(mid_analysis, mid_renderer, n_frames, refine_stats)
         return led_patterns, dominant_leds
 
-    # ------------------------------------------------------------------ #
-    # Ponto de entrada público                                             #
-    # ------------------------------------------------------------------ #
-
-    def process_audio_file(self, audio_file):
-        source_label = audio_file if not self._is_url(audio_file) else "YouTube stream"
-        log_step(f"Carregando áudio: {_c(source_label, C.BYELLOW)}")
-
-        y, sr, duration = self._load_audio_data(audio_file, target_sr=22050)
-        log_sub(f"Duração: {_c(f'{duration:.2f}s', C.BYELLOW)}  |  SR: {_c(f'{sr} Hz', C.BCYAN)}")
-
-        n_frames = max(1, int(duration * self.fps))
-
-        tempo, beat_librosa = librosa.beat.beat_track(y=y, sr=sr)
-        try:
-            tempo_bpm = float(np.asarray(tempo).item())
-        except Exception:
-            tempo_bpm = 120.0
-        if not np.isfinite(tempo_bpm) or tempo_bpm <= 1.0:
-            tempo_bpm = 120.0
-
-        # Converte beat frames (espaço librosa) → frames da partitura (FPS)
-        beat_times_s  = librosa.frames_to_time(beat_librosa, sr=sr)
-        beat_frames   = (beat_times_s * self.fps).astype(np.int32)
-        middle_tempo_bpm = tempo_bpm * self.middle_bpm_multiplier
-        if not np.isfinite(middle_tempo_bpm) or middle_tempo_bpm <= 1.0:
-            middle_tempo_bpm = tempo_bpm
-
-        log_sub(
-            f"BPM detectado: {_c(f'{tempo_bpm:.1f}', C.BMAGENTA, C.BOLD)}"
-            f"  |  {_c(len(beat_frames), C.BYELLOW)} batidas mapeadas"
-        )
-        log_sub(
-            f"BPM LEDs do meio: {_c(f'{middle_tempo_bpm:.1f}', C.BCYAN, C.BOLD)}"
-            f"  ({_c(f'x{self.middle_bpm_multiplier:.1f}', C.BYELLOW)})"
-        )
-
-        section_line()
-        log_step("Fase 1 — Análise estrutural")
-        transitions = self._analyze_structure(y, sr)
-
-        # ---- Snapa cada transição ao beat real mais próximo ----------- #
-        transitions = self._snap_to_beats(
-            transitions, beat_frames, tempo_bpm, self.fps, self.config, n_frames
-        )
-        if transitions:
-            log_sub(_c("Transições alinhadas ao grid de batidas:", C.BBLUE, C.BOLD))
-            for t in transitions:
-                t_s   = t.frame_start / self.fps
-                dur_s = (t.frame_end - t.frame_start) / self.fps
-                icon, color = _EFFECT_ICONS[t.effect_type]
-                log_sub(
-                    f"  t={_c(f'{t_s:6.2f}s', C.BYELLOW)}  "
-                    f"{_c(icon, color)}  {_c(f'{t.effect_type.name:<14}', color, C.BOLD)}"
-                    f"  dur={_c(f'{dur_s:.2f}s', C.BCYAN)}"
-                )
-
-        section_line()
-        log_step(
-            f"Fase 2 — Gerando partitura  "
-            f"({_c(n_frames, C.BYELLOW)} frames @ {_c(self.fps, C.BCYAN)} FPS)"
-        )
-        led_patterns, dominant_leds = self._generate_led_score(
-            y, sr, n_frames, transitions, tempo_bpm, beat_frames
-        )
-        log_ok("Partitura gerada com sucesso!")
-
-        # Telemetria
-        section_line()
-        cfg  = self.config
-        pwms = np.array([v for _, v in led_patterns], dtype=np.int32)
-        sat  = np.mean(pwms >= 245, axis=0) * 100.0
-        dark = np.mean(pwms <= 5,   axis=0) * 100.0
-        avg  = np.mean(pwms, axis=0)
-        num_leds = cfg.NUM_LEDS
-        log_step("Telemetria")
-
-        # Mini bar chart por LED
-        _TBLOCKS = " ▁▂▃▄▅▆▇█"
-        bar_row = ""
-        for i in range(num_leds):
-            blk   = _TBLOCKS[min(int(avg[i] / 255 * 8), 8)]
-            is_edge = (i == 0 or i == num_leds - 1)
-            col   = C.BCYAN if not is_edge else C.BBLUE
-            bar_row += f" {_c(blk * 2, col, C.BOLD)}"
-        log_sub(f"PWM médio (visual):{bar_row}")
-
-        avg_str  = "  ".join(_c(f"L{i+1}:{avg[i]:.0f}", C.BCYAN)  for i in range(num_leds))
-        sat_str  = "  ".join(
-            _c(f"L{i+1}:{sat[i]:.0f}%",  C.BRED    if sat[i]  > 30 else C.BGREEN)
-            for i in range(num_leds)
-        )
-        dark_str = "  ".join(
-            _c(f"L{i+1}:{dark[i]:.0f}%", C.BYELLOW if dark[i] > 60 else C.BRED if dark[i] > 80 else C.BGREEN)
-            for i in range(num_leds)
-        )
-        log_sub(f"PWM médio:          {avg_str}")
-        log_sub(f"Saturado   ≥245:    {sat_str}")
-        log_sub(f"Apagado    ≤5:      {dark_str}")
-
-        # Alertas diagnósticos
-        mid_dark_avg = float(np.mean(dark[1:-1]))
-        edge_sat_avg = float(np.mean(sat[[0, -1]]))
-        if mid_dark_avg > 40:
-            log_warn(
-                f"LEDs do meio apagados {mid_dark_avg:.0f}% do tempo "
-                f"— considere reduzir MIDDLE_FADE_DECAY (atual: {cfg.MIDDLE_FADE_DECAY})"
-            )
-        if edge_sat_avg > 20:
-            log_warn(
-                f"Pontas saturando {edge_sat_avg:.0f}% do tempo "
-                f"— considere reduzir EDGE_PULSE_GAIN ou EDGE_HEAVY_BONUS_GAIN"
-            )
-
-        playback_source = audio_file
-        if self._is_url(audio_file):
-            playback_source = self._create_temp_wav_from_audio(y, sr)
-
-        return led_patterns, duration, playback_source
-
-    # ------------------------------------------------------------------ #
-    # Playback                                                             #
-    # ------------------------------------------------------------------ #
-
-    def _start_ffplay_process(self, audio_source, missing_msg):
-        ffplay_bin = shutil.which("ffplay")
-        if not ffplay_bin:
-            log_err(missing_msg)
-            return None
-        cmd = [ffplay_bin, "-nodisp", "-autoexit", "-loglevel", "quiet", audio_source]
-        try:
-            return subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except Exception as exc:
-            log_err(f"Falha ao iniciar ffplay: {exc}")
-            return None
-
-    def _start_youtube_video_process(self, video_source):
-        mpv_bin = shutil.which("mpv")
-        if not mpv_bin:
-            log_warn(
-                "mpv não encontrado para vídeo no terminal. "
-                "Mantendo reprodução somente de áudio."
-            )
-            return None, ""
-
-        vo_candidates = ("tct", "caca")
-        for vo in vo_candidates:
-            cmd = [
-                mpv_bin,
-                "--no-config",
-                "--really-quiet",
-                "--terminal=yes",
-                "--force-window=no",
-                f"--vo={vo}",
-                video_source,
-            ]
-            try:
-                proc = subprocess.Popen(cmd)
-            except Exception:
-                continue
-            time.sleep(0.7)
-            if proc.poll() is None:
-                return proc, "mpv"
-
-        log_warn(
-            "mpv não conseguiu renderizar vídeo no terminal (vo=tct/caca). "
-            "Mantendo reprodução somente de áudio."
-        )
-        return None, ""
-
-    def sync_and_play(self, audio_source, youtube_video_source=None, track_title=None):
-        led_patterns, duration, playback_source = self.process_audio_file(audio_source)
-
-        if not self.ser or not self.ser.is_open:
-            log_err("Arduino não conectado!")
-            self._cleanup_temp_playback_files()
-            return
-
-        section_line()
-        log_step("Iniciando reprodução sincronizada")
-
-        title = track_title
-        if not title:
-            if self._is_url(audio_source):
-                title = "YouTube"
-            else:
-                title = os.path.basename(str(audio_source))
-        title = str(title) if title else "Faixa"
-
-        session = PlaybackSession(
-            self,
-            playback_source,
-            duration_s=duration,
-            youtube_video_source=youtube_video_source,
-        )
-        if not session.start():
-            self._cleanup_temp_playback_files()
-            return
-
-        ctrl_parts = ["q sair"]
-        if session.supports_pause:
-            ctrl_parts.insert(0, "p/⎵ pausa")
-        if session.supports_seek:
-            ctrl_parts.append("[ ]/←→ seek ±10s")
-        print(_c(f"    Controles: {' | '.join(ctrl_parts)}\n", C.DIM))
-
-        self.playing = True
-        n_frames = len(led_patterns)
-        frame_idx_prev = -1
-        frames_skipped = 0
-        ended_by_user = False
-        show_box = not (self.show_youtube_video and youtube_video_source and session.player_name == "mpv")
-        box = PlaybackBox(
-            title=title,
-            player_name=session.player_name,
-            duration_s=duration,
-            queue_idx=0,
-            queue_total=1,
-        )
-
-        try:
-            with KeyReader() as keys:
-                while self.playing and session.is_alive():
-                    elapsed = session.position_s()
-                    if n_frames <= 0:
-                        break
-                    frame_idx = min(max(int(elapsed * self.fps), 0), n_frames - 1)
-
-                    if frame_idx < frame_idx_prev:
-                        frame_idx_prev = frame_idx - 1
-
-                    if not session.paused and frame_idx != frame_idx_prev:
-                        if frame_idx > frame_idx_prev + 1:
-                            frames_skipped += frame_idx - frame_idx_prev - 1
-                        mode, led_values = led_patterns[frame_idx]
-                        self.send_led_command(led_values, mode=mode)
-                        frame_idx_prev = frame_idx
-
-                    if show_box:
-                        box.draw(
-                            state="PAUSADO" if session.paused else "TOCANDO",
-                            frame_idx=frame_idx,
-                            elapsed_s=elapsed,
-                            paused=session.paused,
-                            supports_seek=session.supports_seek,
-                        )
-
-                    key = keys.read_key() if keys.enabled else None
-                    if key:
-                        k = key.lower() if len(key) == 1 else key
-
-                        if k in ("p", " "):
-                            session.pause(not session.paused)
-
-                        elif k in ("[", "LEFT") and session.supports_seek:
-                            if session.seek(-SEEK_STEP_S):
-                                seek_idx = min(
-                                    max(int(session.position_s() * self.fps), 0),
-                                    n_frames - 1,
-                                )
-                                frame_idx_prev = seek_idx - 1
-
-                        elif k in ("]", "RIGHT") and session.supports_seek:
-                            if session.seek(SEEK_STEP_S):
-                                seek_idx = min(
-                                    max(int(session.position_s() * self.fps), 0),
-                                    n_frames - 1,
-                                )
-                                frame_idx_prev = seek_idx - 1
-
-                        elif k == "q":
-                            ended_by_user = True
-                            break
-
-                    if duration > 0 and elapsed >= duration:
-                        break
-                    time.sleep(0.04)
-
-        except KeyboardInterrupt:
-            ended_by_user = True
-        finally:
-            self.playing = False
-            session.shutdown()
-            self.send_led_command([0] * self.config.NUM_LEDS, mode=1)
-            self._cleanup_temp_playback_files()
-
-        print()
-        section_line()
-        if ended_by_user:
-            log_warn("Reprodução interrompida pelo usuário")
-        else:
-            if frames_skipped:
-                log_warn(f"{frames_skipped} frames pulados por drift de timing")
-            log_ok("Reprodução finalizada!")
-
-
-# ---------------------------------------------------------------------------
-# UI / entrada
-# ---------------------------------------------------------------------------
-
-
-def _get_qt_app_dark():
-    global _QT_ENV_CONFIGURED
-    if not _QT_ENV_CONFIGURED:
-        # Evita warning repetido do Qt em sessões GNOME/Wayland e
-        # mantém fallback para X11 caso plugin wayland não esteja disponível.
-        if os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland":
-            os.environ.setdefault("QT_QPA_PLATFORM", "wayland;xcb")
-        _QT_ENV_CONFIGURED = True
-
-    try:
-        from PyQt5.QtCore import Qt
-        from PyQt5.QtGui import QColor, QPalette
-        from PyQt5.QtWidgets import QApplication
-    except Exception:
-        log_err("PyQt5 não encontrado. Instale com: pip install PyQt5")
-        return None, False
-
-    app = QApplication.instance()
-    owns_app = app is None
-    if owns_app:
-        app = QApplication(sys.argv)
-
-    if app and not app.property("_dark_theme_applied"):
-        app.setStyle("Fusion")
-
-        palette = QPalette()
-        palette.setColor(QPalette.Window, QColor(45, 45, 45))
-        palette.setColor(QPalette.WindowText, QColor(220, 220, 220))
-        palette.setColor(QPalette.Base, QColor(30, 30, 30))
-        palette.setColor(QPalette.AlternateBase, QColor(50, 50, 50))
-        palette.setColor(QPalette.ToolTipBase, QColor(20, 20, 20))
-        palette.setColor(QPalette.ToolTipText, QColor(220, 220, 220))
-        palette.setColor(QPalette.Text, QColor(220, 220, 220))
-        palette.setColor(QPalette.Button, QColor(55, 55, 55))
-        palette.setColor(QPalette.ButtonText, QColor(220, 220, 220))
-        palette.setColor(QPalette.BrightText, Qt.red)
-        palette.setColor(QPalette.Link, QColor(42, 130, 218))
-        palette.setColor(QPalette.Highlight, QColor(42, 130, 218))
-        palette.setColor(QPalette.HighlightedText, Qt.black)
-        app.setPalette(palette)
-        app.setStyleSheet(
-            """
-            QToolTip {
-                color: #dcdcdc;
-                background-color: #202020;
-                border: 1px solid #4a4a4a;
-            }
-            """
-        )
-        app.setProperty("_dark_theme_applied", True)
-
-    return app, owns_app
-
-
-def select_audio_file():
-    try:
-        from PyQt5.QtWidgets import QFileDialog
-    except Exception:
-        log_err("PyQt5 não encontrado. Instale com: pip install PyQt5")
-        return None
-    app, owns_app = _get_qt_app_dark()
-    if app is None:
-        return None
-    filters = (
-        "Arquivos de áudio (*.mp3 *.wav *.flac *.ogg *.m4a *.aac);;"
-        "Todos os arquivos (*)"
-    )
-    selected_file, _ = QFileDialog.getOpenFileName(
-        None, "Selecione o arquivo de áudio", "", filters,
-    )
-    if owns_app:
-        app.quit()
-    return selected_file or None
-
-
-def select_audio_source():
-    try:
-        from PyQt5.QtWidgets import QInputDialog
-    except Exception:
-        log_err("PyQt5 não encontrado. Instale com: pip install PyQt5")
-        return None
-    app, owns_app = _get_qt_app_dark()
-    if app is None:
-        return None
-    options = ["Arquivo local", "Buscar no YouTube (yt-dlp)"]
-    choice, ok = QInputDialog.getItem(
-        None, "Fonte do áudio", "Escolha de onde carregar o áudio:", options, 0, False,
-    )
-    if not ok:
-        if owns_app:
-            app.quit()
-        return None
-    if choice == options[0]:
-        selected_file = select_audio_file()
-        if owns_app:
-            app.quit()
-        return ("file", selected_file) if selected_file else None
-    query, ok = QInputDialog.getText(
-        None, "Buscar no YouTube", "Digite o nome da música ou cole a URL:",
-    )
-    if owns_app:
-        app.quit()
-    if not ok or not query.strip():
-        return None
-    return ("youtube", query.strip())
-
-
-def select_middle_led_speed_multiplier():
-    try:
-        from PyQt5.QtWidgets import QInputDialog
-    except Exception:
-        log_err("PyQt5 não encontrado. Instale com: pip install PyQt5")
-        return None
-    app, owns_app = _get_qt_app_dark()
-    if app is None:
-        return None
-    options = ["Mais lento (1x BPM)", "Mais rápido (2x BPM)"]
-    choice, ok = QInputDialog.getItem(
-        None,
-        "Velocidade LEDs do meio",
-        "Escolha a velocidade dos LEDs do meio:",
-        options,
-        0,
-        False,
-    )
-    if owns_app:
-        app.quit()
-    if not ok:
-        return None
-    return 1.0 if choice == options[0] else 2.0
-
-
-def select_transition_density_profile():
-    try:
-        from PyQt5.QtWidgets import QInputDialog
-    except Exception:
-        log_err("PyQt5 não encontrado. Instale com: pip install PyQt5")
-        return None
-    app, owns_app = _get_qt_app_dark()
-    if app is None:
-        return None
-    options = [
-        "Baixa (menos transições)",
-        "Equilibrada",
-        "Alta (mais transições)",
-    ]
-    choice, ok = QInputDialog.getItem(
-        None,
-        "Quantidade de transições",
-        "Escolha a quantidade de transições:",
-        options,
-        1,
-        False,
-    )
-    if owns_app:
-        app.quit()
-    if not ok:
-        return None
-    if choice == options[0]:
-        return "low"
-    if choice == options[2]:
-        return "high"
-    return "medium"
-
-
-def select_effect_aggressiveness_profile():
-    try:
-        from PyQt5.QtWidgets import QInputDialog
-    except Exception:
-        log_err("PyQt5 não encontrado. Instale com: pip install PyQt5")
-        return None
-    app, owns_app = _get_qt_app_dark()
-    if app is None:
-        return None
-    options = [
-        "Suave",
-        "Equilibrada",
-        "Agressiva",
-    ]
-    choice, ok = QInputDialog.getItem(
-        None,
-        "Agressividade dos efeitos",
-        "Escolha a agressividade dos efeitos:",
-        options,
-        1,
-        False,
-    )
-    if owns_app:
-        app.quit()
-    if not ok:
-        return None
-    if choice == options[0]:
-        return "low"
-    if choice == options[2]:
-        return "high"
-    return "medium"
-
-
-def build_runtime_config(
-    transition_profile: str = "medium",
-    effect_profile: str = "medium",
-) -> EffectConfig:
-    cfg = EffectConfig()
-    overrides = {}
-
-    if transition_profile == "low":
-        overrides.update({
-            "SEG_K_SEGMENTS": 42,
-            "SEG_MIN_GAP_SECONDS": 2.1,
-            "SEG_NOVELTY_THRESHOLD": 0.20,
-            "SEG_STRUCT_CHANGE_THRESHOLD": 0.12,
-        })
-    elif transition_profile == "high":
-        overrides.update({
-            "SEG_K_SEGMENTS": 74,
-            "SEG_MIN_GAP_SECONDS": 0.95,
-            "SEG_NOVELTY_THRESHOLD": 0.13,
-            "SEG_STRUCT_CHANGE_THRESHOLD": 0.08,
-        })
-
-    if effect_profile == "low":
-        overrides.update({
-            "ACTIVE_MAX_PWM": 172.0,
-            "BEAT_BOOST_PWM": 18.0,
-            "MIDDLE_KICK_BRIGHT_GAIN": 95.0,
-            "MIDDLE_STRONG_KICK_BRIGHT_GAIN": 52.0,
-            "EDGE_PULSE_GAIN": 135.0,
-            "NOISE_FLATNESS_THRESHOLD": 0.62,
-            "BRIGHT_CENTROID_THRESHOLD": 0.26,
-        })
-    elif effect_profile == "high":
-        overrides.update({
-            "ACTIVE_MAX_PWM": 220.0,
-            "BEAT_BOOST_PWM": 38.0,
-            "MIDDLE_KICK_BRIGHT_GAIN": 150.0,
-            "MIDDLE_STRONG_KICK_BRIGHT_GAIN": 85.0,
-            "EDGE_PULSE_GAIN": 190.0,
-            "NOISE_FLATNESS_THRESHOLD": 0.48,
-            "BRIGHT_CENTROID_THRESHOLD": 0.18,
-            "TRANS_BLEND_FRAMES": 4,
-        })
-
-    return replace(cfg, **overrides) if overrides else cfg
-
-
-def select_show_youtube_video_in_terminal():
-    try:
-        from PyQt5.QtWidgets import QInputDialog
-    except Exception:
-        log_err("PyQt5 não encontrado. Instale com: pip install PyQt5")
-        return None
-    app, owns_app = _get_qt_app_dark()
-    if app is None:
-        return None
-    options = ["Não", "Sim"]
-    choice, ok = QInputDialog.getItem(
-        None,
-        "Vídeo do YouTube",
-        "Deseja exibir vídeo do YouTube no terminal?",
-        options,
-        0,
-        False,
-    )
-    if owns_app:
-        app.quit()
-    if not ok:
-        return None
-    return choice == options[1]
-
-
-def resolve_youtube_stream(query_or_url):
-    try:
-        import yt_dlp
-    except Exception as exc:
-        raise RuntimeError(
-            "Biblioteca yt-dlp não encontrada. Instale com: pip install yt-dlp"
-        ) from exc
-    ydl_opts = {
-        "quiet": True, "no_warnings": True, "noplaylist": True,
-        "format": "bestaudio/best", "default_search": "ytsearch1",
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(query_or_url, download=False)
-    if not info:
-        raise RuntimeError("yt-dlp não retornou informações do vídeo")
-    if "entries" in info and info["entries"]:
-        info = next((e for e in info["entries"] if e), None)
-        if not info:
-            raise RuntimeError("playlist vazia")
-    formats = info.get("formats") or []
-    stream_url = info.get("url")
-    if not stream_url:
-        audio_only = [
-            f for f in formats
-            if f.get("url")
-            and f.get("acodec") not in (None, "none")
-            and f.get("vcodec") in (None, "none")
-        ]
-        if audio_only:
-            audio_only.sort(key=lambda f: (f.get("abr") or 0.0, f.get("tbr") or 0.0))
-            stream_url = audio_only[-1]["url"]
-    if not stream_url:
-        raise RuntimeError("não foi possível resolver a URL de áudio do YouTube")
-
-    av_formats = [
-        f for f in formats
-        if f.get("url")
-        and f.get("acodec") not in (None, "none")
-        and f.get("vcodec") not in (None, "none")
-    ]
-    video_stream_url = None
-    if av_formats:
-        av_formats.sort(
-            key=lambda f: (f.get("height") or 0.0, f.get("tbr") or 0.0)
-        )
-        video_stream_url = av_formats[-1]["url"]
-    if not video_stream_url:
-        video_stream_url = stream_url
-
-    return stream_url, info.get("title") or "YouTube", video_stream_url
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-def main():
-    banner()
-
-    arduino_port = "/dev/ttyACM0"
-    selection = select_audio_source()
-    if not selection:
-        log_warn("Nenhuma fonte selecionada. Encerrando.")
-        return
-
-    middle_speed_mult = select_middle_led_speed_multiplier()
-    if middle_speed_mult is None:
-        log_warn("Nenhuma velocidade para LEDs do meio selecionada. Encerrando.")
-        return
-    speed_label = "mais rápido (2x BPM)" if middle_speed_mult > 1.0 else "mais lento (padrão)"
-    log_ok(f"Velocidade dos LEDs do meio: {_c(speed_label, C.BYELLOW)}")
-
-    transition_profile = select_transition_density_profile()
-    if transition_profile is None:
-        log_warn("Nenhuma configuração de transições selecionada. Encerrando.")
-        return
-    transition_label = {
-        "low": "baixa",
-        "medium": "equilibrada",
-        "high": "alta",
-    }.get(transition_profile, "equilibrada")
-    log_ok(f"Quantidade de transições: {_c(transition_label, C.BYELLOW)}")
-
-    effect_profile = select_effect_aggressiveness_profile()
-    if effect_profile is None:
-        log_warn("Nenhuma agressividade de efeitos selecionada. Encerrando.")
-        return
-    effect_label = {
-        "low": "suave",
-        "medium": "equilibrada",
-        "high": "agressiva",
-    }.get(effect_profile, "equilibrada")
-    log_ok(f"Agressividade dos efeitos: {_c(effect_label, C.BYELLOW)}")
-
-    runtime_config = build_runtime_config(
-        transition_profile=transition_profile,
-        effect_profile=effect_profile,
-    )
-
-    source_type, source_value = selection
-    show_youtube_video = False
-    youtube_video_source = None
-    track_title = None
-    if source_type == "youtube":
-        show_youtube_video = select_show_youtube_video_in_terminal()
-        if show_youtube_video is None:
-            log_warn("Nenhuma opção de vídeo selecionada. Encerrando.")
-            return
-        video_label = "ativado (terminal)" if show_youtube_video else "desativado"
-        log_ok(f"Vídeo do YouTube: {_c(video_label, C.BYELLOW)}")
-
-        log_step("Resolvendo stream do YouTube via yt-dlp...")
-        try:
-            audio_file, title, youtube_video_source = resolve_youtube_stream(source_value)
-            track_title = title
-            log_ok(f"Stream pronto: {_c(title, C.BYELLOW)}")
-        except Exception as exc:
-            log_err(f"Falha ao resolver stream: {exc}")
-            return
-    else:
-        audio_file = source_value
-        track_title = os.path.basename(str(audio_file))
-
-    controller = MusicLEDController(
-        port=arduino_port,
-        fps=30,
-        config=runtime_config,
-        middle_bpm_multiplier=middle_speed_mult,
-        show_youtube_video=show_youtube_video,
-    )
-
-    section_line()
-    if not controller.connect_arduino():
-        log_warn("Configure a porta serial correta e tente novamente")
-        return
-
-    try:
-        controller.sync_and_play(
-            audio_file,
-            youtube_video_source=youtube_video_source,
-            track_title=track_title,
-        )
-    except FileNotFoundError:
-        log_err(f"Arquivo não encontrado: {audio_file}")
-    except Exception as exc:
-        log_err(f"Erro inesperado: {exc}")
-    finally:
-        controller.disconnect()
-
-    section_line()
-    print(_c("  Obrigado por usar o LED Music Sync! 🎶\n", C.BMAGENTA, C.BOLD))
+    def _build_report(self, ma, rd, n_frames, refine):
+        info, st = ma.info, rd.summary()
+        total = max(1, n_frames)
+        names = ("kick", "grave", "médio", "presença", "brilho")
+        shifts_ms = [abs(s) * 1000.0 / self.fps for s in refine.get("shifts", [])]
+        drops_s = [round(f / self.fps, 2) for f in ma.drop_frames]
+        self.report = {
+            "n_beats": info["n_beats"],
+            "synthetic_grid": info["synthetic_grid"],
+            "beat_confidence": info["mean_beat_conf"],
+            "downbeat_confidence": ma.downbeat_conf,
+            "attacks": {names[g]: info["onsets"][g] for g in range(MID_NUM_BANDS)},
+            "bars": st["bars"],
+            "steps_per_beat": dict(st["spb_hist"]),
+            "pattern_switches": st["pattern_switches"],
+            "section_switches": st["section_switches"],
+            "governor_pct": 100.0 * st["governor_frames"] / total,
+            "transitions_refined": refine.get("refined", 0),
+            "transitions_on_downbeat": refine.get("to_downbeat", 0),
+            "refine_mean_shift_ms": float(np.mean(shifts_ms)) if shifts_ms else 0.0,
+            "refine_max_shift_ms": float(np.max(shifts_ms)) if shifts_ms else 0.0,
+            "drops_s": drops_s,
+        }
+        r = self.report
+        grid = "sintético (BPM)" if r["synthetic_grid"] else f"{r['n_beats']} batidas rastreadas"
+        spb = "  ".join(f"{k}x:{v}" for k, v in sorted(r["steps_per_beat"].items(), key=lambda kv: float(kv[0])))
+        self._note("Motor dos LEDs do meio:")
+        self._note("  ataques por banda → " + "  ".join(f"{k}:{v}" for k, v in r["attacks"].items()))
+        self._note(f"  grid: {grid}  |  confiança de pulso {r['beat_confidence']:.2f}"
+                   f"  |  confiança de compasso {r['downbeat_confidence']:.2f}")
+        self._note(f"  compassos: {r['bars']}  |  passos/batida → {spb}")
+        self._note(f"  sequências: {r['pattern_switches']} trocas ({r['section_switches']} em início de seção)"
+                   f"  |  trava anti-saturação: {r['governor_pct']:.1f}% do tempo")
+        if shifts_ms:
+            self._note(f"  transições refinadas: {r['transitions_refined']}  |  {r['transitions_on_downbeat']} no tempo 1"
+                       f"  |  ajuste médio {r['refine_mean_shift_ms']:.0f} ms (máx {r['refine_max_shift_ms']:.0f} ms)")
+        self._note("  drops detectados: " + (", ".join(f"{d:.1f}s" for d in drops_s) if drops_s else "nenhum"))
 
 
 if __name__ == "__main__":
-    main()
-
-    
+    print("audio_reader6 é o motor de partituras. Abra a interface:  python3 visionaudio7_2.py")
